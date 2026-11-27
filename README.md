@@ -47,10 +47,10 @@ Your original APK and `com.ea.games.r3_row` folder are never modified. Everythin
 | | Minimum | Recommended |
 | --- | --- | --- |
 | OS | Windows 10 (64-bit) | Windows 10 or 11 (64-bit) |
-| CPU | 4-core x86-64 with SSE4.2 (Intel Core i3-6100 / AMD Ryzen 3 1200) | 6-core x86-64 (Intel Core i5-10400 / AMD Ryzen 5 3600) |
+| CPU | Intel Core i3 or AMD Ryzen 3 | Intel Core i5 or AMD Ryzen 5 |
 | RAM | 4 GB | 8 GB |
-| GPU | Direct3D 11 GPU with 1 GB VRAM (Intel UHD 620 / GTX 750 / R7 260) | Direct3D 11 GPU with 2 GB+ VRAM (GTX 1050 / RX 560 or newer) |
-| Storage | 5 GB free (depends on your Android game data) | 8 GB free SSD space |
+| Graphics | Any DirectX 11 GPU (including integrated graphics) | Dedicated DirectX 11 GPU (2 GB VRAM or more) |
+| Storage | 5 GB free space | 8 GB free space (SSD recommended) |
 
 ## FAQ
 
