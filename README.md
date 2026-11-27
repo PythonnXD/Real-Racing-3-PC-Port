@@ -99,7 +99,7 @@ port\package_dist.cmd
 
 ## AI usage
 
-I used AI to help write parts of the codebase, including the runtime shims, graphics and audio bridges, and the Win32 launcher. Every build and fix gets compiled and tested on real Windows hardware against the Android version so the visuals, audio, UI, quality presets, and controls match the original game.
+AI is used to help write parts of the codebase, including the runtime shims, graphics and audio bridges, and the Win32 launcher. Every build and fix gets compiled and tested on real Windows hardware against the Android version so the visuals, audio, UI, quality presets, and controls match the original game.
 
 ## Credits
 
