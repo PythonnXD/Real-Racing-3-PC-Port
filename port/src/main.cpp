@@ -1,6 +1,7 @@
 #include "audio_opensl.h"
 #include "bionic_libc.h"
 #include "config.h"
+#include "configurator.h"
 #include "cpu_dynarmic.h"
 #include "dist_tools.h"
 #include "elf_loader.h"
@@ -193,6 +194,9 @@ int main(int argc, char** argv) {
     bool cli_has_quality = false;
     QualityPreset cli_quality = QualityPreset::Ultra;
     bool cli_config_ui = false;
+    bool cli_play = false;
+    int cli_tab = 0;
+    std::filesystem::path cli_screenshot;
     float cli_render_scale = 0.0f;
     bool cli_has_mode = false;
     WindowMode cli_mode = WindowMode::Windowed;
@@ -233,6 +237,12 @@ int main(int argc, char** argv) {
             config_path = argv[++i];
         } else if (arg == "--config-ui") {
             cli_config_ui = true;
+        } else if (arg == "--play") {
+            cli_play = true;
+        } else if (arg == "--tab" && i + 1 < argc) {
+            cli_tab = std::atoi(argv[++i]);
+        } else if (arg == "--screenshot" && i + 1 < argc) {
+            cli_screenshot = argv[++i];
         } else if (arg == "--verbose") {
             cli_has_verbose = true;
             cli_verbose = true;
@@ -282,35 +292,42 @@ int main(int argc, char** argv) {
         }
     }
 
-    auto launch_configurator_and_exit = [&](const wchar_t* extra_args) -> int {
-        std::filesystem::path cfg_exe = GetExecutableDir() / "rr3_config.exe";
-        std::error_code ec;
-        if (std::filesystem::is_regular_file(cfg_exe, ec)) {
-            std::wstring cmd = L"\"" + cfg_exe.wstring() + L"\"";
-            if (extra_args && *extra_args) {
-                cmd += L" ";
-                cmd += extra_args;
-            }
-            STARTUPINFOW si{};
-            si.cb = sizeof(si);
-            PROCESS_INFORMATION pi{};
-            if (CreateProcessW(cfg_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,
-                               GetExecutableDir().c_str(), &si, &pi)) {
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-                return 0;
-            }
-        }
-        return -1;
-    };
-
-    if (cli_config_ui) {
-        int rc = launch_configurator_and_exit(L"");
-        if (rc == 0) return 0;
-    }
-
     PcConfig cfg = LoadConfig(config_path);
     SaveDefaultConfigIfMissing(config_path, cfg);
+
+    // Interactive double-click launches the built-in Launcher & Configurator UI;
+    // passing --play or any direct game/test CLI flag jumps straight into the game.
+    const bool direct_game_launch =
+        cli_play || cli_has_mode || cli_no_vsync || cli_has_verbose || cli_has_quality ||
+        cli_render_scale > 0.0f || cli_width >= 0 || cli_height >= 0 ||
+        max_frames >= 0 || max_seconds >= 0.0 || !dump_frames.empty() || !timed_dumps.empty();
+    const bool open_launcher = cli_config_ui || !cli_screenshot.empty() || !direct_game_launch;
+
+    if (open_launcher) {
+        LauncherOptions opts;
+        opts.config_path = config_path;
+        opts.initial_tab = cli_tab;
+        opts.screenshot_out = cli_screenshot;
+        if (!RunLauncherUi(opts, cfg)) {
+            return 0;
+        }
+    } else {
+        GameDataStatus data_st = CheckGameDataStatus(cfg);
+        if (!data_st.has_libs || !data_st.has_depot) {
+            std::fprintf(stderr, "[RR3] %s\n", data_st.summary.c_str());
+            if (max_frames < 0 && max_seconds < 0.0) {
+                LauncherOptions opts;
+                opts.config_path = config_path;
+                opts.initial_tab = 3; // Files & saves
+                if (!RunLauncherUi(opts, cfg)) {
+                    return 0;
+                }
+            } else {
+                return 1;
+            }
+        }
+    }
+
     if (cli_no_vsync) cfg.vsync = false;
     if (cli_has_verbose) cfg.verbose_logs = cli_verbose;
     if (cli_has_quality) cfg.quality_preset = cli_quality;
@@ -324,7 +341,7 @@ int main(int argc, char** argv) {
 
     SetVerboseLogging(cfg.verbose_logs);
 
-    // If launched from Explorer / Launcher with Verbose Logs enabled (no redirected stdout pipe/file),
+    // If launched with Verbose Logs enabled (no redirected stdout pipe/file),
     // allocate a live console window so the user can watch engine/JNI/GLES logs in real time.
     if (cfg.verbose_logs) {
         HANDLE h_out = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -338,24 +355,6 @@ int main(int argc, char** argv) {
                 setvbuf(stdout, nullptr, _IONBF, 0);
                 setvbuf(stderr, nullptr, _IONBF, 0);
             }
-        }
-    }
-
-    // Verify stock user-supplied game data exists; if missing, open rr3_config.exe on the Setup tab.
-    {
-        GameDataStatus data_st = CheckGameDataStatus(cfg);
-        if (!data_st.has_libs || !data_st.has_depot) {
-            std::fprintf(stderr, "[RR3] %s\n", data_st.summary.c_str());
-            if (max_frames < 0 && max_seconds < 0.0) {
-                if (launch_configurator_and_exit(L"--tab 3") == 0) {
-                    return 0;
-                }
-                MessageBoxA(nullptr,
-                            (data_st.summary + "\n\nRun rr3_config.exe to configure your RR3 14.0.1 APK and game data folder.").c_str(),
-                            "Real Racing 3 PC — Game Data Required",
-                            MB_OK | MB_ICONINFORMATION);
-            }
-            return 1;
         }
     }
 

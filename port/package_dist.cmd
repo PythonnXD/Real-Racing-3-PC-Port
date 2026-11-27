@@ -10,17 +10,12 @@ if not exist "%BUILD_DIR%\rr3_pc.exe" (
     echo [ERROR] Missing %BUILD_DIR%\rr3_pc.exe - build first with port\build.cmd
     exit /b 1
 )
-if not exist "%BUILD_DIR%\rr3_config.exe" (
-    echo [ERROR] Missing %BUILD_DIR%\rr3_config.exe - build first with port\build.cmd
-    exit /b 1
-)
 
 if exist "%STAGE_DIR%" rmdir /s /q "%STAGE_DIR%"
 if exist "%ZIP_PATH%" del /f /q "%ZIP_PATH%"
 mkdir "%STAGE_DIR%"
 
 copy /y "%BUILD_DIR%\rr3_pc.exe" "%STAGE_DIR%\" >nul
-copy /y "%BUILD_DIR%\rr3_config.exe" "%STAGE_DIR%\" >nul
 copy /y "%BUILD_DIR%\SDL2.dll" "%STAGE_DIR%\" >nul
 copy /y "%BUILD_DIR%\libEGL.dll" "%STAGE_DIR%\" >nul
 copy /y "%BUILD_DIR%\libGLESv2.dll" "%STAGE_DIR%\" >nul

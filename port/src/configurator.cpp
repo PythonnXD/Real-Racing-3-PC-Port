@@ -1,3 +1,4 @@
+#include "configurator.h"
 #include "config.h"
 #include "dist_tools.h"
 #include "../assets/rr3_icon.h"
@@ -708,6 +709,7 @@ public:
     HWND ed_data = nullptr;
 
     std::filesystem::path screenshot_out;
+    bool launch_requested = false;
 
     int S(int px) const { return MulDiv(px, static_cast<int>(dpi), 96); }
     float Sf(float px) const { return px * static_cast<float>(dpi) / 96.0f; }
@@ -1404,7 +1406,12 @@ public:
 
             DrawGroupedContainer(g, kContentX, 322, kContentW, 130, {386});
             std::wstring save_path = Utf8ToWide((std::filesystem::path(cfg.userdata_dir) / "doc").string());
-            draw_txt(kContentX + 16, 330, kContentW - 32, 22, save_path.c_str(), f_mono, br_text);
+            Gdiplus::StringFormat sf_path;
+            sf_path.SetAlignment(Gdiplus::StringAlignmentNear);
+            sf_path.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+            sf_path.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+            sf_path.SetTrimming(Gdiplus::StringTrimmingEllipsisPath);
+            draw_txt(kContentX + 16, 330, kContentW - 32, 22, save_path.c_str(), f_mono, br_text, &sf_path);
             draw_txt(kContentX + 16, 354, kContentW - 32, 20,
                      L"Supports character.2.dat or .zip backups. Existing saves are backed up first.", f_sub, br_mut);
 
@@ -1550,7 +1557,7 @@ public:
             }
             case HitKind::BtnBrowseApk: {
                 std::filesystem::path p;
-                if (PickFileDialog(hwnd, L"Select Real Racing 3 14.0.1 APK",
+                if (PickFileDialog(hwnd, L"Select Real Racing 3 APK",
                                    L"Android APK (*.apk)\0*.apk\0All Files (*.*)\0*.*\0", p)) {
                     cfg.apk_path = p.string();
                     SetWindowTextW(ed_apk, p.c_str());
@@ -1561,7 +1568,7 @@ public:
             case HitKind::BtnExtractApk: {
                 ReadEditsToConfig();
                 if (cfg.apk_path.empty()) {
-                    SetToast(L"Select an APK first", kColRed);
+                    SetToast(L"Select a Real Racing 3 APK first", kColRed);
                     break;
                 }
                 SetToast(L"Extracting libraries...");
@@ -1676,24 +1683,8 @@ public:
                     SetToast(L"Add Android game files first", kColAmber);
                     break;
                 }
-                auto game_exe = GetExecutableDir() / "rr3_pc.exe";
-                std::error_code ec;
-                if (!std::filesystem::is_regular_file(game_exe, ec)) {
-                    SetToast(L"rr3_pc.exe not found", kColRed);
-                    break;
-                }
-                std::wstring cmd = L"\"" + game_exe.wstring() + L"\" --config \"" + config_path.wstring() + L"\"";
-                STARTUPINFOW si{};
-                si.cb = sizeof(si);
-                PROCESS_INFORMATION pi{};
-                if (CreateProcessW(game_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,
-                                   GetExecutableDir().c_str(), &si, &pi)) {
-                    CloseHandle(pi.hThread);
-                    CloseHandle(pi.hProcess);
-                    PostQuitMessage(0);
-                } else {
-                    SetToast(L"Launch failed", kColRed);
-                }
+                launch_requested = true;
+                DestroyWindow(hwnd);
                 break;
             }
             default: break;
@@ -1836,15 +1827,9 @@ public:
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int show_cmd) {
-    if (HMODULE u32 = GetModuleHandleW(L"user32.dll")) {
-        using Fn = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
-        if (auto fn = reinterpret_cast<Fn>(GetProcAddress(u32, "SetProcessDpiAwarenessContext"))) {
-            fn(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        }
-    }
-
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+bool RunLauncherUi(const LauncherOptions& opts, PcConfig& out_cfg) {
+    HINSTANCE hinst = GetModuleHandleW(nullptr);
+    HRESULT com_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
 
@@ -1854,21 +1839,9 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int show_cmd) {
 
     ConfiguratorApp app;
     app.hinst = hinst;
-    app.config_path = ResolveDefaultConfigPath();
-
-    int argc = 0;
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    for (int i = 1; i < argc; ++i) {
-        std::wstring a = argv[i];
-        if (a == L"--config" && i + 1 < argc) {
-            app.config_path = argv[++i];
-        } else if (a == L"--tab" && i + 1 < argc) {
-            app.active_tab = std::clamp(_wtoi(argv[++i]), 0, 3);
-        } else if (a == L"--screenshot" && i + 1 < argc) {
-            app.screenshot_out = argv[++i];
-        }
-    }
-    if (argv) LocalFree(argv);
+    app.config_path = opts.config_path.empty() ? ResolveDefaultConfigPath() : opts.config_path;
+    app.active_tab = std::clamp(opts.initial_tab, 0, 3);
+    app.screenshot_out = opts.screenshot_out;
 
     app.cfg = LoadConfig(app.config_path);
     SaveDefaultConfigIfMissing(app.config_path, app.cfg);
@@ -1884,16 +1857,20 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int show_cmd) {
     app.h_icon_small = static_cast<HICON>(LoadImageW(hinst, MAKEINTRESOURCEW(IDI_APP_ICON),
                                                      IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
 
-    WNDCLASSEXW wc{};
-    wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = ConfiguratorApp::StaticWndProc;
-    wc.hInstance = hinst;
-    wc.hIcon = app.h_icon_large;
-    wc.hIconSm = app.h_icon_small;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.lpszClassName = L"RR3PcConfiguratorWnd";
-    RegisterClassExW(&wc);
+    static bool class_registered = false;
+    if (!class_registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = ConfiguratorApp::StaticWndProc;
+        wc.hInstance = hinst;
+        wc.hIcon = app.h_icon_large;
+        wc.hIconSm = app.h_icon_small;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"RR3PcConfiguratorWnd";
+        RegisterClassExW(&wc);
+        class_registered = true;
+    }
 
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     RECT rc{0, 0, app.S(kBaseW), app.S(kBaseH)};
@@ -1906,15 +1883,17 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int show_cmd) {
     int wx = work.left + std::max(0L, (work.right - work.left - win_w) / 2);
     int wy = work.top + std::max(0L, (work.bottom - work.top - win_h) / 2);
 
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"Real Racing 3 PC",
+    HWND hwnd = CreateWindowExW(0, L"RR3PcConfiguratorWnd", L"Real Racing 3 PC",
                                 style, wx, wy, win_w, win_h, nullptr, nullptr, hinst, &app);
     if (!hwnd) {
+        if (app.h_icon_large) DestroyIcon(app.h_icon_large);
+        if (app.h_icon_small) DestroyIcon(app.h_icon_small);
         Gdiplus::GdiplusShutdown(gdip_token);
-        CoUninitialize();
-        return 1;
+        if (SUCCEEDED(com_hr)) CoUninitialize();
+        return false;
     }
 
-    ShowWindow(hwnd, show_cmd);
+    ShowWindow(hwnd, SW_SHOWNORMAL);
     UpdateWindow(hwnd);
 
     MSG msg{};
@@ -1926,9 +1905,14 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int show_cmd) {
         DispatchMessageW(&msg);
     }
 
+    bool should_launch = app.launch_requested;
+    if (should_launch) {
+        out_cfg = app.cfg;
+    }
+
     if (app.h_icon_large) DestroyIcon(app.h_icon_large);
     if (app.h_icon_small) DestroyIcon(app.h_icon_small);
     Gdiplus::GdiplusShutdown(gdip_token);
-    CoUninitialize();
-    return 0;
+    if (SUCCEEDED(com_hr)) CoUninitialize();
+    return should_launch;
 }

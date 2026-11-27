@@ -156,9 +156,10 @@ target_link_libraries(test_gles_jni PRIVATE
 )
 target_compile_definitions(test_gles_jni PRIVATE SDL_MAIN_HANDLED)
 
-# ---- Main Native PC Port Executable (rr3_pc.exe) ----
+# ---- Main Native PC Port Executable (rr3_pc.exe, includes built-in Launcher & Configurator UI) ----
 add_executable(rr3_pc WIN32
     src/main.cpp
+    src/configurator.cpp
     src/java_firemint.cpp
     src/java_offline_stubs.cpp
     src/audio_opensl.cpp
@@ -178,21 +179,6 @@ target_link_libraries(rr3_pc PRIVATE
     SDL2_local
     zlibstatic
     dwrite
-)
-target_compile_definitions(rr3_pc PRIVATE SDL_MAIN_HANDLED)
-if(MSVC)
-    target_link_options(rr3_pc PRIVATE /ENTRY:mainCRTStartup)
-endif()
-
-# ---- Native Win32 Launcher & Configurator GUI (rr3_config.exe) ----
-add_executable(rr3_config WIN32
-    src/configurator.cpp
-    assets/rr3_icon.rc
-    assets/rr3_app.manifest
-)
-target_include_directories(rr3_config PRIVATE src)
-target_link_libraries(rr3_config PRIVATE
-    rr3_config_lib
     comctl32
     comdlg32
     dwmapi
@@ -201,6 +187,10 @@ target_link_libraries(rr3_config PRIVATE
     shell32
     uxtheme
 )
+target_compile_definitions(rr3_pc PRIVATE SDL_MAIN_HANDLED)
+if(MSVC)
+    target_link_options(rr3_pc PRIVATE /ENTRY:mainCRTStartup)
+endif()
 
 # ---- Task 7 Input (Virtual Gamepads + Keyboard Ramp), Resize & Dist Tools Test ----
 add_executable(test_input_resize

@@ -156,9 +156,9 @@ GameDataStatus CheckGameDataStatus(const PcConfig& cfg) {
     if (st.has_libs && st.hash_matches && st.has_depot) {
         oss << "Ready to play (RR3 v14.0.1 ARM64 libraries verified + .depot assets found)";
     } else if (!st.has_libs && !st.has_depot) {
-        oss << "Setup required: select your stock RR3 14.0.1 APK to extract libraries and select com.ea.games.r3_row data folder.";
+        oss << "Setup required: select your Real Racing 3 APK to extract libraries and select com.ea.games.r3_row data folder.";
     } else if (!st.has_libs) {
-        oss << "Missing ARM64 libraries: browse for RR3 14.0.1 APK and click Extract & Verify.";
+        oss << "Missing ARM64 libraries: browse for Real Racing 3 APK and click Extract.";
     } else if (!st.hash_matches) {
         oss << "Warning: libRealRacing3.so SHA-256 differs from v14.0.1 (" << st.rr3_sha256.substr(0, 12) << "...).";
         if (!st.has_depot) oss << " Also missing .depot game data folder.";
