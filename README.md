@@ -2,7 +2,7 @@
 
 A native Windows x64 runtime and launcher for **Real Racing 3 (Android v14.0.1 ARM64)**. It runs offline with Direct3D 11 rendering through ANGLE, WASAPI audio, keyboard and gamepad support, and a native Win32 launcher.
 
-> **Game files notice:** This repository and its releases include no copyrighted EA or Firemonkeys files. You must provide your own stock Android `RR3 14.0.1.apk` (game engine libraries) and `com.ea.games.r3_row` folder (tracks, cars, and audio). All PC fixes run in memory without changing your original Android files.
+> **Game files notice:** This repository does not ship with game data, you have to provide the game's APK and Data to able to run.
 
 ## What works
 
