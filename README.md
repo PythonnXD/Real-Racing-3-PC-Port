@@ -18,13 +18,13 @@ Opening `rr3_pc.exe` brings up the launcher. Hit **Play** and the game starts ri
 Under the hood, Dynarmic translates the game's ARM64 binary into native x86-64 code on the fly, backed by a custom ELF64 loader, Bionic/JNI shims, ANGLE (OpenGL ES over Direct3D 11), DirectWrite text rendering, and WASAPI audio.
 
 From the launcher you can tweak:
-- Windowed, Borderless, and Fullscreen modes (`F10` cycles modes, `F11` or `Alt+Enter` toggles fullscreen) with automatic monitor fit and no black bars on landscape displays
+- Windowed, Borderless, and Fullscreen modes (`F10` cycles modes, `F11` or `Alt+Enter` toggles fullscreen) with automatic monitor fit
 - V-Sync, frame rate cap, and removing the 30 FPS menu cap
 - Native RR3 quality presets (`Low`, `Medium`, `High`, `Ultra`), render scale (`75%` to `200%`), and anisotropic filtering (`Off` to `16x`)
 - Optional verbose console logs
 - Remappable keyboard controls (`W`/`Up` throttle, `S`/`Space` brake, `A`/`D` or Arrows steer, `C` camera, `V` look back, `Esc` pause)
 - Plug-and-play Xbox, DualShock 4, DualSense, and Switch Pro controllers (`A`/`RT` throttle, `X`/`LT` brake, `LB`/`Y` camera, `RB`/`B` look back, Left Stick or D-Pad steer)
-- Save import and export (`character.2.dat` or `.zip` backups)
+- Save import and export (`character.2.dat` backups)
 
 ## Installing
 
