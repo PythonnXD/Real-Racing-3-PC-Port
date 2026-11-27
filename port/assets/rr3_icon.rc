@@ -1,0 +1,3 @@
+#include "rr3_icon.h"
+
+IDI_APP_ICON ICON "rr3_icon.ico"
