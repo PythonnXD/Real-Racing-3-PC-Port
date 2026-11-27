@@ -9,12 +9,6 @@ A native Windows x64 port of Real Racing 3 (Android). It runs offline through Di
 > [!WARNING]
 > This repo and its releases do not include any EA or Firemonkeys game files. You need to provide your own Real Racing 3 APK and `com.ea.games.r3_row` data folder.
 
-> [!IMPORTANT]
-> Parts of the codebase (runtime shims, graphics/audio bridges, and the Win32 launcher) were written with AI assistance. Everything was compiled and tested on real Windows hardware against the original Android game so visuals, audio, controls, and UI match the original.
-
-> [!CAUTION]
-> Don't extract the game into `C:\Program Files`, since Windows can block save writes there. Use a normal folder like `C:\Games\RealRacing3PC`. The launcher backs up your existing `userdata\doc` folder before importing a save, though keeping your own copy is still smart.
-
 ## What's in it
 
 Opening `rr3_pc.exe` brings up the launcher. Hit **Play** and the game starts right in the same process (or run `rr3_pc.exe --play` to skip the launcher).
@@ -32,6 +26,9 @@ From the launcher you can tweak:
 
 ## Installing
 
+> [!CAUTION]
+> Don't extract the game into `C:\Program Files`, since Windows can block save writes there. Use a normal folder like `C:\Games\RealRacing3PC`. The launcher backs up your existing `userdata\doc` folder before importing a save, though keeping your own copy is still smart.
+
 1. Grab `RealRacing3-PC-Port.zip` from [Releases](https://github.com/PythonnXD/Real-Racing-3-PC-Port/releases) and extract it somewhere writable like `C:\Games\RealRacing3PC`.
 2. Make sure you have your **Real Racing 3 APK** (`arm64-v8a`) and **`com.ea.games.r3_row`** data folder (the one with `files\.depot` inside).
 3. Run `rr3_pc.exe` and go to **Files & saves**.
@@ -43,6 +40,9 @@ From the launcher you can tweak:
 Your original APK and `com.ea.games.r3_row` folder are never modified. Everything the game writes goes into the local `userdata` folder.
 
 ## System requirements
+
+> [!IMPORTANT]
+> Both 64-bit Windows and a 64-bit (`arm64-v8a`) Android APK are required. 32-bit Windows and `armeabi-v7a` APKs are not supported.
 
 | | Minimum | Recommended |
 | --- | --- | --- |
@@ -89,6 +89,10 @@ Then build and package:
 port\build.cmd rr3_pc test_input_resize
 port\package_dist.cmd
 ```
+
+## AI usage
+
+Parts of the codebase (runtime shims, graphics and audio bridges, and the Win32 launcher) were written with AI assistance. Every build, control layout, quality preset, and fix was compiled and tested on real Windows hardware against the original Android game so visuals, audio, controls, and UI match the original.
 
 ## Credits
 
