@@ -1,10 +1,7 @@
-# Copyrighted Android game files — NEVER commit
 *.apk
 *.xapk
 *.obb
 com.ea.games.r3_row/
-
-# Extracted binaries, user saves, build outputs, third-party dependencies, and release staging
 port/work_bins/
 port/userdata/
 port/build/
@@ -12,8 +9,6 @@ port/third_party/
 port/tools/
 port/analysis/
 dist/
-
-# Build & runtime artifacts
 *.exe
 *.dll
 *.pdb
