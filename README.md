@@ -72,6 +72,11 @@ Untested. Other `arm64-v8a` builds may boot, though some PC patches are locked t
 ### Is it done?
 Playable offline from menus through full races. Online modes stay disabled, and fixes are still ongoing.
 
+### Will you make the port for Linux and macOS?
+Windows is the focus right now, though a Linux port is possible later since most of the core runtime (`Dynarmic`, `SDL2`, `zlib`) is already cross-platform and only the Windows-specific layers (Win32 launcher, DirectWrite, ANGLE D3D11, and Win32 memory calls) need Linux equivalents. Community PRs are welcome.
+
+If you're on an Apple Silicon Mac, someone has already put together a macOS port you can check out [here on Reddit](https://www.reddit.com/r/RealRacing3/s/UUhAgimbK8).
+
 ## Building from source
 
 You'll need Visual Studio 2022 (MSVC x64 C++20), CMake, and Ninja, plus these dependencies under `port/third_party/`:
