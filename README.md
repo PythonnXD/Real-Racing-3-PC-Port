@@ -1,6 +1,6 @@
 # Real Racing 3 PC Port
 
-A native Windows x64 runtime and launcher for **Real Racing 3 (Android v14.0.1 ARM64)**. It runs offline with Direct3D 11 rendering through ANGLE, WASAPI audio, keyboard and gamepad support, and a native Win32 launcher.
+A native Windows x64 runtime and launcher for **Real Racing 3 (Android)**. It runs offline with Direct3D 11 rendering through ANGLE, WASAPI audio, keyboard and gamepad support, and a native Win32 launcher.
 
 > **Game files notice:** This repository does not ship with game data, you have to provide the game's APK and Data to able to run.
 
@@ -22,8 +22,8 @@ A native Windows x64 runtime and launcher for **Real Racing 3 (Android v14.0.1 A
 
 1. Download `RealRacing3-PC-Port.zip` from Releases and extract it.
 2. Open `rr3_config.exe` and switch to **Files & saves**.
-3. Pick your Android **Real Racing 3 v14.0.1 APK** and click **Extract**.
-4. Pick your Android **`com.ea.games.r3_row`** (or `files`) folder.
+3. Pick the APK of Real Racing 3 you downloaded.
+4. Pick the Data of Real Racing 3 you downloaded.
 5. Click **Play**.
 
 ## Building from source (Windows x64)
