@@ -9,9 +9,6 @@ A native Windows x64 runtime and launcher for **Real Racing 3 (Android v14.0.1 A
 - **Native Win64 runtime:** Runs the ARM64 binary with Dynarmic JIT, 64-bit fastmem, a custom ELF64 loader, and Bionic libc, JNI, and OpenSL ES to WASAPI shims.
 - **Direct3D 11 rendering:** Translates OpenGL ES 2.0/3.0 to D3D11 via ANGLE, decodes ATC and ETC1 textures, renders fonts with DirectWrite, and supports up to 16x anisotropic filtering.
 - **PC display and graphics:**
-  - Fits the initial window inside your monitor's usable work area so it never spills off 1600x900 or laptop screens.
-  - Supports Windowed, Borderless, and Fullscreen (`F10` cycles modes, `F11` or `Alt+Enter` toggles fullscreen).
-  - Keeps UI scale fixed while widening the render target to match your window aspect ratio, removing black bars.
   - Configurable V-Sync, frame rate cap, menu frame rate limit removal, native RR3 Quality presets (`Low`, `Medium`, `High`, `Ultra`), render scale (`75%` to `200%`), anisotropic filtering (`Off` to `16x`), and verbose console logging.
 - **Keyboard and gamepad controls:**
   - Smooth keyboard steering ramp with remappable keys (`W`/`Up` throttle, `S`/`Space` brake, `A`/`D`/Arrows steer, `C` camera, `V` look back, `Esc` pause).
@@ -23,7 +20,7 @@ A native Windows x64 runtime and launcher for **Real Racing 3 (Android v14.0.1 A
 
 ## Quick start (prebuilt release)
 
-1. Download `RealRacing3-PC-Port-Win64.zip` from Releases and extract it.
+1. Download `RealRacing3-PC-Port.zip` from Releases and extract it.
 2. Open `rr3_config.exe` and switch to **Files & saves**.
 3. Pick your Android **Real Racing 3 v14.0.1 APK** and click **Extract**.
 4. Pick your Android **`com.ea.games.r3_row`** (or `files`) folder.
