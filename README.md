@@ -1,8 +1,10 @@
-﻿<p align="center">
-  <img src="assets/banner.jpg" alt="Real Racing 3 PC Port" width="100%" />
-</p>
+﻿# Real Racing 3 PC Port
 
-# Real Racing 3 PC Port
+[![Release](https://img.shields.io/github/v/release/PythonnXD/Real-Racing-3-PC-Port)](https://github.com/PythonnXD/Real-Racing-3-PC-Port/releases)
+[![Downloads](https://img.shields.io/github/downloads/PythonnXD/Real-Racing-3-PC-Port/total)](https://github.com/PythonnXD/Real-Racing-3-PC-Port/releases)
+[![License](https://img.shields.io/github/license/PythonnXD/Real-Racing-3-PC-Port)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D6)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C)
 
 A native Windows x64 port of Real Racing 3 (Android). It runs offline through Direct3D 11 (via ANGLE) and WASAPI audio, with keyboard, gamepad, and a built-in launcher packed into one executable.
 
@@ -97,7 +99,7 @@ port\package_dist.cmd
 
 ## AI usage
 
-Parts of the codebase (runtime shims, graphics and audio bridges, and the Win32 launcher) were written with AI assistance. Every build, control layout, quality preset, and fix was compiled and tested on real Windows hardware against the original Android game so visuals, audio, controls, and UI match the original.
+I used AI to help write parts of the codebase, including the runtime shims, graphics and audio bridges, and the Win32 launcher. Every build and fix gets compiled and tested on real Windows hardware against the Android version so the visuals, audio, UI, quality presets, and controls match the original game.
 
 ## Credits
 
