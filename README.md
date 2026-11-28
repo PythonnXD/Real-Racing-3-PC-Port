@@ -25,6 +25,7 @@ From the launcher you can tweak:
 - Remappable keyboard controls (`W`/`Up` throttle, `S`/`Space` brake, `A`/`D` or Arrows steer, `C` camera, `V` look back, `Esc` pause)
 - Plug-and-play Xbox, DualShock 4, DualSense, and Switch Pro controllers (`A`/`RT` throttle, `X`/`LT` brake, `LB`/`Y` camera, `RB`/`B` look back, Left Stick or D-Pad steer)
 - Save import and export (`character.2.dat` backups)
+- Built-in update notifications and one-click or automatic updates from GitHub Releases
 
 ## Installing
 
@@ -72,7 +73,7 @@ Tested on Real Racing 3 v14.0.1 (`arm64-v8a`).
 Untested. Other `arm64-v8a` builds may boot, though some PC patches are locked to the tested binary so unknown builds don't break. 32-bit `armeabi-v7a` APKs won't work.
 
 ### Can I play Project Resurrection with this?
-Yes. Point **Data folder** at your extracted Project Resurrection `com.ea.games.r3_row` folder and select a matching `arm64-v8a` APK in **Files & saves**. The port detects the pack's texture format and `2048x1536` UI assets on startup.
+Yes. Point **Data folder** at your extracted Project Resurrection `com.ea.games.r3_row` folder and select a matching `arm64-v8a` APK in **Files & saves**. The port detects the pack's texture format and UI assets on startup.
 
 ### What GPU file of the game does it need?
 Any of them. The port scans your `.depot` folder on startup and works with Adreno (`.atc.dds.z`), Mali (`.etc.dds.z`), Xclipse/Tegra (`.dxt.dds.z`), and PowerVR (`.ptc.pvr.z`) packs. You do not need to match the Android GPU variant to your PC graphics card.
@@ -82,7 +83,7 @@ If you have a choice, Adreno is the most tested so far, and DXT packs decode dir
 ### Why do I get stuck on the downloading assets screen?
 If you already have the full game data and still get stuck on "Downloading assets", check these:
 
-- Update to the latest release. Older builds only exposed Adreno textures and capped UI detection at `1080p`, which caused Mali, Xclipse, PowerVR, and `2048x1536` phone backups to get stuck looking for missing files.
+- Update to the latest release. Older builds only exposed Adreno textures and had stricter UI resolution checks, which caused Mali, Xclipse, PowerVR, and high-resolution phone backups to get stuck looking for missing files.
 - Make sure your APK and `com.ea.games.r3_row` backup come from the same game build. If the build ID inside `.depot/asset_list_base.txtCache.txt` does not match the APK, the game treats the local files as outdated and tries to re-download them.
 - Keep your APK path set in **Files & saves**. If your backup only copied `.depot` without `files/apk/res/`, the port needs the APK to unpack its internal resource files into `userdata/apk/res/`.
 - Double-check that your selected **Data folder** points to `com.ea.games.r3_row` (with `files\.depot` inside) and that the archive finished extracting cleanly.

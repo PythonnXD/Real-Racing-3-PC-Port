@@ -66,10 +66,11 @@ foreach(dll ${RR3_RUNTIME_DLLS})
     configure_file("${dll}" "${CMAKE_BINARY_DIR}/${dll_name}" COPYONLY)
 endforeach()
 
-# ---- Core config + distribution tools library ----
+# ---- Core config + distribution tools + updater library ----
 add_library(rr3_config_lib STATIC
     src/config.cpp
     src/dist_tools.cpp
+    src/updater.cpp
 )
 target_include_directories(rr3_config_lib PUBLIC
     src
@@ -79,6 +80,7 @@ target_include_directories(rr3_config_lib PUBLIC
 target_link_libraries(rr3_config_lib PUBLIC
     zlibstatic
     bcrypt
+    winhttp
 )
 
 # ---- Core CPU + ELF Loader library ----

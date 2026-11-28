@@ -5,6 +5,7 @@
 #include "gles_bridge.h"
 #include "input_pc.h"
 #include "jni_env.h"
+#include "updater.h"
 #include "vfs.h"
 
 #include <SDL.h>
@@ -581,8 +582,66 @@ void TestConfigQualityVerboseAndDistTools() {
         CHECK(p_pvr.gpu_format == DepotGpuFormat::Pvrtc && p_pvr.gui_tier == DepotGuiTier::Res2048x1536);
     }
 
+    // 6. Updater: semver comparison, trusted URL check, GitHub JSON parsing, and safe zip staging
+    {
+        CHECK(CompareSemver("1.0.0", "v1.1.0") < 0);
+        CHECK(CompareSemver("v1.1.0", "1.1.0") == 0);
+        CHECK(CompareSemver("1.10.0", "1.2.0") > 0);
+        CHECK(CompareSemver("2.0.0", "1.9.9") > 0);
+
+        CHECK(IsTrustedGithubUrl("https://github.com/PythonnXD/Real-Racing-3-PC-Port/releases/download/v1.1.0/RealRacing3-PC-Port.zip"));
+        CHECK(IsTrustedGithubUrl("https://objects.githubusercontent.com/github-production-release-asset/foo.zip"));
+        CHECK(!IsTrustedGithubUrl("http://github.com/foo.zip"));
+        CHECK(!IsTrustedGithubUrl("https://evil-github.com.attacker.test/foo.zip"));
+
+        const std::string sample_json = R"({
+            "tag_name": "v1.2.0",
+            "name": "Real Racing 3 PC Port v1.2.0",
+            "draft": false,
+            "prerelease": false,
+            "html_url": "https://github.com/PythonnXD/Real-Racing-3-PC-Port/releases/tag/v1.2.0",
+            "body": "Line 1\r\n- Fix A\r\n- Fix \"B\"",
+            "assets": [
+                {"name": "checksums.txt", "size": 128, "browser_download_url": "https://github.com/PythonnXD/Real-Racing-3-PC-Port/releases/download/v1.2.0/checksums.txt"},
+                {"name": "RealRacing3-PC-Port.zip", "size": 7458423, "browser_download_url": "https://github.com/PythonnXD/Real-Racing-3-PC-Port/releases/download/v1.2.0/RealRacing3-PC-Port.zip"}
+            ]
+        })";
+        ReleaseInfo rel = ParseLatestReleaseJson(sample_json, "1.1.0");
+        CHECK(rel.ok && rel.update_available);
+        CHECK(rel.latest_version == "1.2.0" && rel.asset_name == "RealRacing3-PC-Port.zip" && rel.asset_size == 7458423);
+        CHECK(rel.release_notes.find("Fix \"B\"") != std::string::npos);
+
+        ReleaseInfo same = ParseLatestReleaseJson(sample_json, "1.2.0");
+        CHECK(same.ok && !same.update_available);
+
+        // Stage extraction from our real packaged dist zip into temp install dir:
+        // verify rr3_pc.exe extracts AND existing rr3_pc.ini is preserved (not overwritten in staging)!
+        const fs::path dist_zip = R"(d:\Real Racing 3\dist\RealRacing3-PC-Port-Win64.zip)";
+        if (fs::is_regular_file(dist_zip, ec)) {
+            const fs::path inst = tmp / "fake_install";
+            const fs::path stage = inst / "_update_staging";
+            fs::create_directories(inst, ec);
+            { std::ofstream ini_f(inst / "rr3_pc.ini"); ini_f << "custom_user_setting=1\n"; }
+            std::string uerr;
+            CHECK(ExtractUpdateZipToStaging(dist_zip, stage, inst, uerr));
+            CHECK(fs::is_regular_file(stage / "rr3_pc.exe", ec));
+            CHECK(fs::is_regular_file(stage / "SDL2.dll", ec));
+            CHECK(!fs::exists(stage / "rr3_pc.ini", ec)); // user's existing INI must NOT be overwritten!
+        }
+
+        // Config round-trip for updater flags
+        PcConfig uc;
+        uc.auto_check_updates = true;
+        uc.auto_install_updates = true;
+        uc.skipped_update_version = "1.1.0";
+        const fs::path uini = tmp / "upd_cfg.ini";
+        CHECK(SaveConfig(uini, uc));
+        PcConfig uc2 = LoadConfig(uini);
+        CHECK(uc2.auto_check_updates && uc2.auto_install_updates && uc2.skipped_update_version == "1.1.0");
+    }
+
     fs::remove_all(tmp, ec);
-    std::printf("  [PASS] test_config_quality_verbose_and_dist_tools (Quality Low..Ultra VFS, Verbose INI, Save Import/Export+Backup, APK libs+res, 4-GPU DepotProfile)\n");
+    std::printf("  [PASS] test_config_quality_verbose_and_dist_tools (Quality Low..Ultra VFS, Verbose INI, Save Import/Export+Backup, APK libs+res, 4-GPU DepotProfile, Updater)\n");
 }
 
 } // namespace

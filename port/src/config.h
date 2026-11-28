@@ -3,6 +3,9 @@
 #include <filesystem>
 #include <string>
 
+inline constexpr const char* kPortVersion = "1.1.0";
+inline constexpr const char* kGithubRepoSlug = "PythonnXD/Real-Racing-3-PC-Port";
+
 enum class WindowMode {
     Windowed,
     Borderless,
@@ -56,6 +59,10 @@ struct PcConfig {
     std::string readonly_files_dir;
     std::string userdata_dir;
     std::string work_bins_dir;
+    // Updater settings
+    bool auto_check_updates = true;
+    bool auto_install_updates = false;
+    std::string skipped_update_version;
 };
 
 WindowMode ParseWindowMode(const std::string& val, WindowMode fallback = WindowMode::Windowed);

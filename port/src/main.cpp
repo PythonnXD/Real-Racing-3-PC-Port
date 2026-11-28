@@ -10,6 +10,7 @@
 #include "java_firemint.h"
 #include "java_offline_stubs.h"
 #include "jni_env.h"
+#include "updater.h"
 #include "vfs.h"
 #include "../assets/rr3_icon.h"
 
@@ -196,8 +197,12 @@ int main(int argc, char** argv) {
     QualityPreset cli_quality = QualityPreset::Ultra;
     bool cli_config_ui = false;
     bool cli_play = false;
+    bool cli_check_update = false;
+    bool cli_no_update_check = false;
     int cli_tab = 0;
     std::filesystem::path cli_screenshot;
+    std::filesystem::path cli_update_popup_screenshot;
+    std::string cli_simulate_version;
     float cli_render_scale = 0.0f;
     bool cli_has_mode = false;
     WindowMode cli_mode = WindowMode::Windowed;
@@ -244,6 +249,14 @@ int main(int argc, char** argv) {
             cli_tab = std::atoi(argv[++i]);
         } else if (arg == "--screenshot" && i + 1 < argc) {
             cli_screenshot = argv[++i];
+        } else if (arg == "--test-update-popup" && i + 1 < argc) {
+            cli_update_popup_screenshot = argv[++i];
+        } else if (arg == "--simulate-old-version" && i + 1 < argc) {
+            cli_simulate_version = argv[++i];
+        } else if (arg == "--check-update") {
+            cli_check_update = true;
+        } else if (arg == "--no-update-check") {
+            cli_no_update_check = true;
         } else if (arg == "--verbose") {
             cli_has_verbose = true;
             cli_verbose = true;
@@ -297,19 +310,38 @@ int main(int argc, char** argv) {
     PcConfig cfg = LoadConfig(config_path);
     SaveDefaultConfigIfMissing(config_path, cfg);
 
+    if (cli_check_update) {
+        std::string cur_v = cli_simulate_version.empty() ? kPortVersion : cli_simulate_version;
+        ReleaseInfo rel = CheckForUpdates(cur_v, kGithubRepoSlug);
+        if (!rel.ok) {
+            std::fprintf(stderr, "[UPDATE] Check failed: %s\n", rel.error.c_str());
+            return 1;
+        }
+        std::fprintf(stdout, "[UPDATE] current=v%s latest=v%s available=%s asset=%s (%llu bytes)\n",
+                     rel.current_version.c_str(), rel.latest_version.c_str(),
+                     rel.update_available ? "YES" : "NO",
+                     rel.asset_name.c_str(),
+                     static_cast<unsigned long long>(rel.asset_size));
+        return 0;
+    }
+
     // Interactive double-click launches the built-in Launcher & Configurator UI;
     // passing --play or any direct game/test CLI flag jumps straight into the game.
     const bool direct_game_launch =
         cli_play || cli_has_mode || cli_no_vsync || cli_has_verbose || cli_has_quality ||
         cli_render_scale > 0.0f || cli_width >= 0 || cli_height >= 0 ||
         max_frames >= 0 || max_seconds >= 0.0 || !dump_frames.empty() || !timed_dumps.empty();
-    const bool open_launcher = cli_config_ui || !cli_screenshot.empty() || !direct_game_launch;
+    const bool open_launcher = cli_config_ui || !cli_screenshot.empty() ||
+                               !cli_update_popup_screenshot.empty() || !direct_game_launch;
 
     if (open_launcher) {
         LauncherOptions opts;
         opts.config_path = config_path;
         opts.initial_tab = cli_tab;
         opts.screenshot_out = cli_screenshot;
+        opts.update_popup_screenshot = cli_update_popup_screenshot;
+        opts.simulate_version = cli_simulate_version;
+        opts.disable_update_check = cli_no_update_check;
         if (!RunLauncherUi(opts, cfg)) {
             return 0;
         }

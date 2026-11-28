@@ -351,6 +351,9 @@ PcConfig LoadConfig(const std::filesystem::path& path) {
             else if (key == "readonly_files_dir") cfg.readonly_files_dir = val;
             else if (key == "userdata_dir") cfg.userdata_dir = val;
             else if (key == "work_bins_dir") cfg.work_bins_dir = val;
+            else if (key == "auto_check_updates") cfg.auto_check_updates = ParseBool(val);
+            else if (key == "auto_install_updates") cfg.auto_install_updates = ParseBool(val);
+            else if (key == "skipped_update_version") cfg.skipped_update_version = val;
         } catch (const std::exception&) {
             // Keep default value on malformed numeric INI entry
         }
@@ -410,7 +413,13 @@ bool SaveConfig(const std::filesystem::path& path, const PcConfig& cfg) {
         << "key_rear_view=" << cfg.key_rear_view << "\n"
         << "key_confirm=" << cfg.key_confirm << "\n"
         << "key_back=" << cfg.key_back << "\n"
-        << "key_pause=" << cfg.key_pause << "\n";
+        << "key_pause=" << cfg.key_pause << "\n"
+        << "\n[updates]\n"
+        << "auto_check_updates=" << (cfg.auto_check_updates ? "true" : "false") << "\n"
+        << "auto_install_updates=" << (cfg.auto_install_updates ? "true" : "false") << "\n";
+    if (!cfg.skipped_update_version.empty()) {
+        out << "skipped_update_version=" << cfg.skipped_update_version << "\n";
+    }
 
     if (!cfg.apk_path.empty() || !cfg.readonly_files_dir.empty() ||
         !cfg.userdata_dir.empty() || !cfg.work_bins_dir.empty()) {

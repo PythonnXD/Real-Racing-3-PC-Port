@@ -1,6 +1,7 @@
 #include "configurator.h"
 #include "config.h"
 #include "dist_tools.h"
+#include "updater.h"
 #include "../assets/rr3_icon.h"
 
 #ifndef UNICODE
@@ -23,10 +24,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -152,10 +156,17 @@ enum class HitKind {
     BtnImportSave,
     BtnExportSave,
     BtnOpenSaveDir,
+    ToggleAutoUpdate,
+    BtnCheckUpdate,
+    BtnOpenUpdate,
     BtnPlay,
     BtnSave,
     BtnReset,
 };
+
+constexpr UINT WM_APP_UPDATE_CHECK_DONE = WM_APP + 10;
+constexpr UINT WM_APP_UPDATE_PROGRESS   = WM_APP + 11;
+constexpr UINT WM_APP_UPDATE_DONE       = WM_APP + 12;
 
 struct HitZone {
     RECT rc{};
@@ -654,6 +665,457 @@ int ShowCustomDropdown(HWND owner, HINSTANCE hinst, UINT dpi, RECT anchor_client
     return st.chosen;
 }
 
+// ---- Custom Dark GDI+ Update Pop-Up (Download, Progress Bar, Auto-Install & Self-Replace) ----
+enum class UpdatePopupResult {
+    Later,
+    SkipVersion,
+    ApplyingUpdate,
+};
+
+struct UpdatePopupState {
+    HWND hwnd = nullptr;
+    HWND owner = nullptr;
+    HINSTANCE hinst = nullptr;
+    UINT dpi = 96;
+    ReleaseInfo rel;
+    bool auto_start = false;
+    std::filesystem::path screenshot_out;
+
+    enum class Phase { Idle, Downloading, Extracting, Error, Done };
+    Phase phase = Phase::Idle;
+    int progress_pct = 0;
+    std::wstring status_text;
+    UpdatePopupResult result = UpdatePopupResult::Later;
+    bool closed = false;
+
+    std::atomic<bool> cancel_flag{false};
+    std::shared_ptr<std::atomic<bool>> alive = std::make_shared<std::atomic<bool>>(true);
+    std::thread worker;
+
+    enum class Btn { None, UpdateNow, Later, Skip, ReleaseLink, Cancel };
+    struct Zone { RECT rc{}; Btn btn = Btn::None; };
+    std::vector<Zone> zones;
+    Btn hovered = Btn::None;
+    Btn pressed = Btn::None;
+
+    int S(int px) const { return MulDiv(px, static_cast<int>(dpi), 96); }
+    float Sf(float px) const { return px * static_cast<float>(dpi) / 96.0f; }
+
+    static std::wstring FormatBytes(uint64_t b) {
+        wchar_t buf[48]{};
+        if (b >= 1024ULL * 1024ULL) {
+            swprintf_s(buf, L"%.1f MB", static_cast<double>(b) / (1024.0 * 1024.0));
+        } else if (b >= 1024ULL) {
+            swprintf_s(buf, L"%.0f KB", static_cast<double>(b) / 1024.0);
+        } else {
+            swprintf_s(buf, L"%llu B", static_cast<unsigned long long>(b));
+        }
+        return buf;
+    }
+
+    void StartDownload() {
+        if (phase == Phase::Downloading || phase == Phase::Extracting) return;
+        if (worker.joinable()) worker.join();
+        cancel_flag.store(false, std::memory_order_relaxed);
+        phase = Phase::Downloading;
+        progress_pct = 0;
+        status_text = L"Connecting to GitHub...";
+        InvalidateRect(hwnd, nullptr, FALSE);
+
+        HWND target = hwnd;
+        auto alive_tok = alive;
+        std::string url = rel.download_url;
+        std::string asset_name = rel.asset_name.empty() ? "RealRacing3-PC-Port.zip" : rel.asset_name;
+        uint64_t expected_sz = rel.asset_size;
+        std::filesystem::path install_dir = GetExecutableDir();
+        std::filesystem::path zip_path = install_dir / "_update_download.zip";
+        std::filesystem::path staging_dir = install_dir / "_update_staging";
+
+        worker = std::thread([this, target, alive_tok, url, asset_name, expected_sz, install_dir, zip_path, staging_dir]() {
+            auto post_progress = [&](int pct, const std::wstring& txt) {
+                if (!alive_tok->load(std::memory_order_acquire)) return;
+                auto* msg = new std::wstring(txt);
+                if (!PostMessageW(target, WM_APP_UPDATE_PROGRESS, static_cast<WPARAM>(pct),
+                                  reinterpret_cast<LPARAM>(msg))) {
+                    delete msg;
+                }
+            };
+            auto post_done = [&](bool ok, const std::wstring& txt) {
+                if (!alive_tok->load(std::memory_order_acquire)) return;
+                auto* msg = new std::wstring(txt);
+                if (!PostMessageW(target, WM_APP_UPDATE_DONE, ok ? 1 : 0, reinterpret_cast<LPARAM>(msg))) {
+                    delete msg;
+                }
+            };
+
+            std::string err;
+            int last_pct = -1;
+            bool ok = DownloadFileWithProgress(
+                url, zip_path,
+                [&](uint64_t got, uint64_t total) {
+                    uint64_t denom = total > 0 ? total : expected_sz;
+                    int pct = denom > 0 ? static_cast<int>(std::min<uint64_t>(100, (got * 100) / denom)) : 0;
+                    if (pct != last_pct) {
+                        last_pct = pct;
+                        std::wstring s = L"Downloading " + Utf8ToWide(asset_name) + L" (" + FormatBytes(got);
+                        if (denom > 0) s += L" / " + FormatBytes(denom);
+                        s += L")";
+                        post_progress(pct, s);
+                    }
+                },
+                &cancel_flag, err);
+            if (!ok) {
+                post_done(false, Utf8ToWide(err));
+                return;
+            }
+
+            post_progress(101, L"Extracting update files...");
+            if (!ExtractUpdateZipToStaging(zip_path, staging_dir, install_dir, err)) {
+                std::error_code ec;
+                std::filesystem::remove(zip_path, ec);
+                post_done(false, Utf8ToWide(err));
+                return;
+            }
+
+            post_progress(101, L"Restarting to apply update...");
+            if (!LaunchUpdateApplyHelper(staging_dir, zip_path, install_dir, err)) {
+                post_done(false, Utf8ToWide(err));
+                return;
+            }
+            post_done(true, L"Applying update...");
+        });
+    }
+
+    Btn HitTest(int mx, int my) const {
+        POINT pt{mx, my};
+        for (const auto& z : zones) {
+            if (PtInRect(&z.rc, pt)) return z.btn;
+        }
+        return Btn::None;
+    }
+
+    void Paint(HDC hdc) {
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        int cw = rc.right - rc.left;
+        int ch = rc.bottom - rc.top;
+        if (cw <= 0 || ch <= 0) return;
+
+        HDC mdc = CreateCompatibleDC(hdc);
+        HBITMAP mbm = CreateCompatibleBitmap(hdc, cw, ch);
+        HGDIOBJ old = SelectObject(mdc, mbm);
+        zones.clear();
+
+        Gdiplus::Graphics g(mdc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
+
+        Gdiplus::SolidBrush br_bg(ToGdip(kColBg));
+        g.FillRectangle(&br_bg, 0, 0, cw, ch);
+
+        Gdiplus::FontFamily ff(L"Segoe UI");
+        Gdiplus::FontFamily ff_mono(L"Consolas");
+        Gdiplus::Font f_title(&ff, Sf(18.0f), Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+        Gdiplus::Font f_body(&ff, Sf(13.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+        Gdiplus::Font f_semi(&ff, Sf(13.0f), Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+        Gdiplus::Font f_sub(&ff, Sf(12.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+        Gdiplus::Font f_mono(&ff_mono, Sf(11.5f), Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+
+        Gdiplus::SolidBrush br_txt(ToGdip(kColText));
+        Gdiplus::SolidBrush br_sec(ToGdip(kColSecondary));
+        Gdiplus::SolidBrush br_mut(ToGdip(kColMuted));
+        Gdiplus::StringFormat sf_left;
+        sf_left.SetAlignment(Gdiplus::StringAlignmentNear);
+        sf_left.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+        Gdiplus::StringFormat sf_center;
+        sf_center.SetAlignment(Gdiplus::StringAlignmentCenter);
+        sf_center.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+
+        // Header + Version Pill
+        g.DrawString(L"Update available", -1, &f_title,
+                     Gdiplus::RectF(Sf(22.0f), Sf(16.0f), Sf(240.0f), Sf(28.0f)), &sf_left, &br_txt);
+
+        std::wstring pill_txt = L"v" + Utf8ToWide(rel.current_version) + L"  ->  v" + Utf8ToWide(rel.latest_version);
+        {
+            float px = Sf(290.0f), py = Sf(18.0f), pw = Sf(148.0f), ph = Sf(24.0f);
+            Gdiplus::SolidBrush pbg(Gdiplus::Color(44, 47, 129, 247));
+            Gdiplus::Pen pbd(Gdiplus::Color(110, 47, 129, 247), 1.0f);
+            FillRoundRect(g, px, py, pw, ph, Sf(12.0f), pbg);
+            DrawRoundRect(g, px, py, pw, ph, Sf(12.0f), pbd);
+            Gdiplus::SolidBrush ptxt(ToGdip(RGB(130, 184, 255)));
+            g.DrawString(pill_txt.c_str(), -1, &f_mono, Gdiplus::RectF(px, py, pw, ph), &sf_center, &ptxt);
+        }
+
+        std::wstring sub = Utf8ToWide(rel.release_name);
+        if (rel.asset_size > 0) sub += L"  ·  " + FormatBytes(rel.asset_size);
+        g.DrawString(sub.c_str(), -1, &f_sub,
+                     Gdiplus::RectF(Sf(22.0f), Sf(46.0f), Sf(416.0f), Sf(20.0f)), &sf_left, &br_sec);
+
+        // Release notes card (y=76..252)
+        {
+            Gdiplus::SolidBrush cbg(ToGdip(kColCard));
+            Gdiplus::Pen cbd(Gdiplus::Color(22, 255, 255, 255), 1.0f);
+            FillRoundRect(g, Sf(22.0f), Sf(76.0f), Sf(416.0f), Sf(174.0f), Sf(10.0f), cbg);
+            DrawRoundRect(g, Sf(22.0f), Sf(76.0f), Sf(416.0f), Sf(174.0f), Sf(10.0f), cbd);
+
+            std::wstring notes = rel.release_notes.empty()
+                                     ? L"A new version of Real Racing 3 PC Port is ready to install.\nYour saves, settings, and Android game files are kept untouched."
+                                     : Utf8ToWide(rel.release_notes);
+            Gdiplus::StringFormat sf_wrap;
+            sf_wrap.SetAlignment(Gdiplus::StringAlignmentNear);
+            sf_wrap.SetLineAlignment(Gdiplus::StringAlignmentNear);
+            sf_wrap.SetFormatFlags(Gdiplus::StringFormatFlagsLineLimit);
+            sf_wrap.SetTrimming(Gdiplus::StringTrimmingEllipsisWord);
+            g.DrawString(notes.c_str(), -1, &f_sub,
+                         Gdiplus::RectF(Sf(36.0f), Sf(88.0f), Sf(388.0f), Sf(150.0f)), &sf_wrap, &br_sec);
+        }
+
+        // Progress / Status row (y=262..294)
+        if (phase == Phase::Downloading || phase == Phase::Extracting) {
+            g.DrawString(status_text.c_str(), -1, &f_sub,
+                         Gdiplus::RectF(Sf(22.0f), Sf(260.0f), Sf(416.0f), Sf(18.0f)), &sf_left, &br_txt);
+            Gdiplus::SolidBrush trk(ToGdip(kColRaised));
+            FillRoundRect(g, Sf(22.0f), Sf(284.0f), Sf(416.0f), Sf(6.0f), Sf(3.0f), trk);
+            float frac = (phase == Phase::Extracting) ? 1.0f : std::clamp(progress_pct / 100.0f, 0.04f, 1.0f);
+            Gdiplus::SolidBrush fill(ToGdip(phase == Phase::Extracting ? kColGreen : kColAccent));
+            FillRoundRect(g, Sf(22.0f), Sf(284.0f), Sf(416.0f * frac), Sf(6.0f), Sf(3.0f), fill);
+        } else if (phase == Phase::Error) {
+            Gdiplus::SolidBrush br_err(ToGdip(kColRed));
+            g.DrawString(status_text.c_str(), -1, &f_sub,
+                         Gdiplus::RectF(Sf(22.0f), Sf(264.0f), Sf(416.0f), Sf(24.0f)), &sf_left, &br_err);
+        } else if (!rel.html_url.empty()) {
+            zones.push_back({{S(22), S(264), S(220), S(288)}, Btn::ReleaseLink});
+            Gdiplus::SolidBrush br_lnk(ToGdip(hovered == Btn::ReleaseLink ? kColAccentHov : kColAccent));
+            g.DrawString(L"View release notes on GitHub", -1, &f_sub,
+                         Gdiplus::RectF(Sf(22.0f), Sf(264.0f), Sf(220.0f), Sf(24.0f)), &sf_left, &br_lnk);
+        }
+
+        // Bottom action buttons (y=304..338)
+        auto draw_btn = [&](int x, int y, int w, int h, const wchar_t* txt, Btn b, bool primary) {
+            zones.push_back({{S(x), S(y), S(x + w), S(y + h)}, b});
+            bool hov = (hovered == b);
+            bool prs = (pressed == b);
+            COLORREF bg = primary ? (prs ? RGB(214, 214, 218) : (hov ? RGB(252, 252, 253) : RGB(237, 237, 239)))
+                                  : (prs ? kColRaisedPress : (hov ? kColRaisedHov : kColRaised));
+            COLORREF fg = primary ? RGB(17, 17, 19) : kColText;
+            Gdiplus::SolidBrush br(ToGdip(bg));
+            FillRoundRect(g, Sf(static_cast<float>(x)), Sf(static_cast<float>(y)),
+                          Sf(static_cast<float>(w)), Sf(static_cast<float>(h)), Sf(8.0f), br);
+            if (!primary) {
+                Gdiplus::Pen bd(Gdiplus::Color(hov ? 38 : 22, 255, 255, 255), 1.0f);
+                DrawRoundRect(g, Sf(static_cast<float>(x)), Sf(static_cast<float>(y)),
+                              Sf(static_cast<float>(w)), Sf(static_cast<float>(h)), Sf(8.0f), bd);
+            }
+            Gdiplus::SolidBrush tb(ToGdip(fg));
+            g.DrawString(txt, -1, primary ? &f_semi : &f_body,
+                         Gdiplus::RectF(Sf(static_cast<float>(x)), Sf(static_cast<float>(y)),
+                                        Sf(static_cast<float>(w)), Sf(static_cast<float>(h))),
+                         &sf_center, &tb);
+        };
+
+        if (phase == Phase::Downloading || phase == Phase::Extracting) {
+            draw_btn(342, 304, 96, 34, L"Cancel", Btn::Cancel, false);
+        } else {
+            draw_btn(22, 304, 106, 34, L"Skip version", Btn::Skip, false);
+            draw_btn(232, 304, 78, 34, L"Later", Btn::Later, false);
+            draw_btn(318, 304, 120, 34, phase == Phase::Error ? L"Retry" : L"Update now", Btn::UpdateNow, true);
+        }
+
+        BitBlt(hdc, 0, 0, cw, ch, mdc, 0, 0, SRCCOPY);
+        SelectObject(mdc, old);
+        DeleteObject(mbm);
+        DeleteDC(mdc);
+    }
+
+    static LRESULT CALLBACK Proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+        auto* st = reinterpret_cast<UpdatePopupState*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+        if (msg == WM_NCCREATE) {
+            st = static_cast<UpdatePopupState*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
+            SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(st));
+            st->hwnd = h;
+            return TRUE;
+        }
+        if (!st) return DefWindowProcW(h, msg, wp, lp);
+
+        switch (msg) {
+            case WM_CREATE: {
+                BOOL dark = TRUE;
+                DwmSetWindowAttribute(h, 20, &dark, sizeof(dark));
+                COLORREF cap = kColBg;
+                DwmSetWindowAttribute(h, 35, &cap, sizeof(cap));
+                if (!st->screenshot_out.empty()) {
+                    SetTimer(h, 1, 180, nullptr);
+                } else if (st->auto_start) {
+                    st->StartDownload();
+                }
+                return 0;
+            }
+            case WM_TIMER:
+                if (wp == 1) {
+                    KillTimer(h, 1);
+                    RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+                    CaptureWindowToPng(h, st->screenshot_out);
+                    st->closed = true;
+                }
+                return 0;
+            case WM_ERASEBKGND:
+                return 1;
+            case WM_PAINT: {
+                PAINTSTRUCT ps{};
+                HDC hdc = BeginPaint(h, &ps);
+                st->Paint(hdc);
+                EndPaint(h, &ps);
+                return 0;
+            }
+            case WM_APP_UPDATE_PROGRESS: {
+                auto* txt = reinterpret_cast<std::wstring*>(lp);
+                if (wp >= 101) {
+                    st->phase = Phase::Extracting;
+                    st->progress_pct = 100;
+                } else {
+                    st->phase = Phase::Downloading;
+                    st->progress_pct = static_cast<int>(wp);
+                }
+                if (txt) { st->status_text = *txt; delete txt; }
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
+            case WM_APP_UPDATE_DONE: {
+                auto* txt = reinterpret_cast<std::wstring*>(lp);
+                std::wstring m = txt ? *txt : L"";
+                delete txt;
+                if (wp != 0) {
+                    st->phase = Phase::Done;
+                    st->result = UpdatePopupResult::ApplyingUpdate;
+                    st->closed = true;
+                } else {
+                    st->phase = Phase::Error;
+                    st->status_text = m.empty() ? L"Update failed." : m;
+                    InvalidateRect(h, nullptr, FALSE);
+                }
+                return 0;
+            }
+            case WM_MOUSEMOVE: {
+                Btn nb = st->HitTest(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+                if (nb != st->hovered) {
+                    st->hovered = nb;
+                    InvalidateRect(h, nullptr, FALSE);
+                }
+                SetCursor(LoadCursorW(nullptr, nb != Btn::None ? IDC_HAND : IDC_ARROW));
+                TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0};
+                TrackMouseEvent(&tme);
+                return 0;
+            }
+            case WM_MOUSELEAVE:
+                if (st->hovered != Btn::None) { st->hovered = Btn::None; InvalidateRect(h, nullptr, FALSE); }
+                return 0;
+            case WM_LBUTTONDOWN:
+                st->pressed = st->HitTest(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+                if (st->pressed != Btn::None) { SetCapture(h); InvalidateRect(h, nullptr, FALSE); }
+                return 0;
+            case WM_LBUTTONUP: {
+                Btn pb = st->pressed;
+                st->pressed = Btn::None;
+                if (GetCapture() == h) ReleaseCapture();
+                Btn hb = st->HitTest(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+                if (pb != Btn::None && pb == hb) {
+                    if (pb == Btn::UpdateNow) {
+                        st->StartDownload();
+                    } else if (pb == Btn::Later) {
+                        st->result = UpdatePopupResult::Later;
+                        st->closed = true;
+                    } else if (pb == Btn::Skip) {
+                        st->result = UpdatePopupResult::SkipVersion;
+                        st->closed = true;
+                    } else if (pb == Btn::Cancel) {
+                        st->cancel_flag.store(true, std::memory_order_relaxed);
+                        st->status_text = L"Cancelling...";
+                        InvalidateRect(h, nullptr, FALSE);
+                    } else if (pb == Btn::ReleaseLink && !st->rel.html_url.empty()) {
+                        ShellExecuteW(h, L"open", Utf8ToWide(st->rel.html_url).c_str(),
+                                      nullptr, nullptr, SW_SHOWNORMAL);
+                    }
+                }
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
+            case WM_KEYDOWN:
+                if (wp == VK_ESCAPE && st->phase != Phase::Downloading && st->phase != Phase::Extracting) {
+                    st->result = UpdatePopupResult::Later;
+                    st->closed = true;
+                }
+                return 0;
+            case WM_CLOSE:
+                if (st->phase == Phase::Downloading) {
+                    st->cancel_flag.store(true, std::memory_order_relaxed);
+                }
+                st->closed = true;
+                return 0;
+        }
+        return DefWindowProcW(h, msg, wp, lp);
+    }
+};
+
+UpdatePopupResult ShowUpdatePopup(HWND owner, HINSTANCE hinst, UINT dpi,
+                                  const ReleaseInfo& rel, bool auto_start,
+                                  const std::filesystem::path& screenshot_out = {}) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = UpdatePopupState::Proc;
+        wc.hInstance = hinst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"RR3UpdatePopupWnd";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    UpdatePopupState st;
+    st.owner = owner;
+    st.hinst = hinst;
+    st.dpi = dpi;
+    st.rel = rel;
+    st.auto_start = auto_start;
+    st.screenshot_out = screenshot_out;
+
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    RECT rc{0, 0, st.S(460), st.S(356)};
+    AdjustWindowRectEx(&rc, style, FALSE, 0);
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
+
+    RECT orc{};
+    GetWindowRect(owner, &orc);
+    int x = orc.left + ((orc.right - orc.left) - w) / 2;
+    int y = orc.top + ((orc.bottom - orc.top) - h) / 2;
+
+    EnableWindow(owner, FALSE);
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"RR3UpdatePopupWnd", L"Real Racing 3 PC — Update",
+                               style, x, y, w, h, owner, nullptr, hinst, &st);
+    if (!dlg) {
+        EnableWindow(owner, TRUE);
+        return UpdatePopupResult::Later;
+    }
+    ShowWindow(dlg, SW_SHOWNORMAL);
+    UpdateWindow(dlg);
+
+    MSG msg{};
+    while (!st.closed && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    st.alive->store(false, std::memory_order_release);
+    st.cancel_flag.store(true, std::memory_order_relaxed);
+    if (st.worker.joinable()) st.worker.join();
+    DestroyWindow(dlg);
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+    return st.result;
+}
+
 class ConfiguratorApp {
 public:
     HWND hwnd = nullptr;
@@ -689,10 +1151,21 @@ public:
     SpringState sp_vsync;
     SpringState sp_menu_fps;
     SpringState sp_verbose;
+    SpringState sp_auto_update;
     SpringState sp_press;
     bool anim_timer_on = false;
     LARGE_INTEGER qpc_freq{};
     LARGE_INTEGER qpc_last{};
+
+    // Background update state
+    ReleaseInfo latest_release;
+    bool update_checking = false;
+    bool update_restarting = false;
+    std::wstring update_status_line;
+    std::string effective_version = kPortVersion;
+    bool disable_update_check = false;
+    std::filesystem::path update_popup_screenshot;
+    std::shared_ptr<std::atomic<bool>> alive_flag = std::make_shared<std::atomic<bool>>(true);
 
     HICON h_icon_large = nullptr;
     HICON h_icon_small = nullptr;
@@ -734,6 +1207,7 @@ public:
         sp_vsync.Snap(cfg.vsync ? 1.0f : 0.0f);
         sp_menu_fps.Snap(cfg.unlock_menu_fps ? 1.0f : 0.0f);
         sp_verbose.Snap(cfg.verbose_logs ? 1.0f : 0.0f);
+        sp_auto_update.Snap(cfg.auto_install_updates ? 1.0f : 0.0f);
         sp_press.Snap(1.0f);
     }
 
@@ -751,12 +1225,53 @@ public:
         moving |= sp_vsync.Step(dt, 0.18f);
         moving |= sp_menu_fps.Step(dt, 0.18f);
         moving |= sp_verbose.Step(dt, 0.18f);
+        moving |= sp_auto_update.Step(dt, 0.18f);
         moving |= sp_press.Step(dt, 0.14f);
 
         InvalidateRect(hwnd, nullptr, FALSE);
         if (!moving && anim_timer_on) {
             KillTimer(hwnd, 2);
             anim_timer_on = false;
+        }
+    }
+
+    void StartUpdateCheckAsync(bool manual) {
+        if (update_checking || !hwnd) return;
+        update_checking = true;
+        update_status_line = L"v" + Utf8ToWide(effective_version) + L" · Checking...";
+        if (manual) SetToast(L"Checking for updates...");
+        InvalidateRect(hwnd, nullptr, FALSE);
+
+        HWND target = hwnd;
+        auto alive = alive_flag;
+        std::string ver = effective_version;
+        std::thread([target, alive, ver, manual]() {
+            ReleaseInfo info = CheckForUpdates(ver, kGithubRepoSlug);
+            if (!alive->load(std::memory_order_acquire)) return;
+            auto* heap_info = new ReleaseInfo(std::move(info));
+            if (!PostMessageW(target, WM_APP_UPDATE_CHECK_DONE, manual ? 1 : 0,
+                              reinterpret_cast<LPARAM>(heap_info))) {
+                delete heap_info;
+            }
+        }).detach();
+    }
+
+    void OpenUpdateDialog(bool auto_start) {
+        if (!latest_release.update_available) return;
+        UpdatePopupResult res = ShowUpdatePopup(hwnd, hinst, dpi, latest_release,
+                                                auto_start, update_popup_screenshot);
+        if (!update_popup_screenshot.empty()) {
+            DestroyWindow(hwnd);
+            return;
+        }
+        if (res == UpdatePopupResult::SkipVersion) {
+            cfg.skipped_update_version = latest_release.latest_version;
+            SaveConfig(config_path, cfg);
+            SetToast(L"Skipped v" + Utf8ToWide(latest_release.latest_version));
+        } else if (res == UpdatePopupResult::ApplyingUpdate) {
+            update_restarting = true;
+            launch_requested = false;
+            DestroyWindow(hwnd);
         }
     }
 
@@ -1213,7 +1728,8 @@ public:
             DrawIconEx(mem_dc, S(20), S(20), h_icon_large, S(40), S(40), 0, nullptr, DI_NORMAL);
         }
         draw_txt(72, 20, 132, 22, L"Real Racing 3", f_brand, br_text);
-        draw_txt(72, 42, 132, 18, L"14.0.1 · Win64", f_mono, br_mut);
+        std::wstring ver_sub = L"v" + Utf8ToWide(effective_version) + L" · Win64";
+        draw_txt(72, 42, 132, 18, ver_sub.c_str(), f_mono, br_mut);
 
         // ---- Sidebar Navigation (4 clean 36px rows, 4px gap) ----
         const wchar_t* nav_labels[] = {L"Display", L"Graphics", L"Controls", L"Files & saves"};
@@ -1255,6 +1771,11 @@ public:
 
         // ---- Sidebar Bottom Action Rail ----
         {
+            if (latest_release.update_available) {
+                std::wstring up_lbl = L"Update v" + Utf8ToWide(latest_release.latest_version);
+                DrawButton(g, f_sub_semi, 16, 388, kSidebarW - 32, 28, up_lbl.c_str(),
+                           HitKind::BtnOpenUpdate, 0, false, true);
+            }
             g.DrawLine(&rail_div, Sf(16.0f), Sf(428.0f), Sf(static_cast<float>(kSidebarW - 16)), Sf(428.0f));
             bool ready = data_status.has_libs && data_status.has_depot;
             Gdiplus::SolidBrush dot(ToGdip(ready ? kColGreen : kColAmber));
@@ -1417,6 +1938,23 @@ public:
             DrawButton(g, f_sub_semi, kContentX + 16,  402, 160, 34, L"Import save", HitKind::BtnImportSave);
             DrawButton(g, f_sub_semi, kContentX + 184, 402, 160, 34, L"Export save", HitKind::BtnExportSave);
             DrawButton(g, f_sub,      kContentX + 352, 402, 160, 34, L"Open folder", HitKind::BtnOpenSaveDir);
+
+            // Section: Port updates (y=470..532)
+            DrawGroupedContainer(g, kContentX, 470, kContentW, 62);
+            draw_txt(kContentX + 16, 479, 200, 20, L"Updates", f_body, br_text);
+            std::wstring ust = update_status_line.empty()
+                                   ? (L"v" + Utf8ToWide(effective_version))
+                                   : update_status_line;
+            Gdiplus::SolidBrush br_ust(ToGdip(latest_release.update_available ? kColAmber : kColMuted));
+            draw_txt(kContentX + 16, 501, 224, 18, ust.c_str(), f_sub, br_ust);
+
+            draw_txt(kContentX + 248, 470, 88, 62, L"Auto-update", f_sub, br_sec, &sf_right);
+            DrawToggleSwitch(g, kContentX + 346, 489, sp_auto_update.val, HitKind::ToggleAutoUpdate);
+
+            const wchar_t* chk_lbl = update_checking ? L"Checking..."
+                                                     : (latest_release.update_available ? L"Update" : L"Check now");
+            DrawButton(g, f_sub_semi, kContentX + 412, 485, 100, 32, chk_lbl,
+                       HitKind::BtnCheckUpdate, 0, false, latest_release.update_available);
         }
 
         BitBlt(hdc, 0, 0, cw, ch, mem_dc, 0, 0, SRCCOPY);
@@ -1646,6 +2184,24 @@ public:
                 ShellExecuteW(hwnd, L"open", doc.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                 break;
             }
+            case HitKind::ToggleAutoUpdate:
+                cfg.auto_install_updates = !cfg.auto_install_updates;
+                sp_auto_update.target = cfg.auto_install_updates ? 1.0f : 0.0f;
+                dirty = true;
+                SaveConfig(config_path, cfg);
+                SetToast(cfg.auto_install_updates ? L"Auto-update enabled" : L"Auto-update off", kColGreen);
+                StartAnimTimer();
+                break;
+            case HitKind::BtnCheckUpdate:
+                if (latest_release.update_available) {
+                    OpenUpdateDialog(false);
+                } else {
+                    StartUpdateCheckAsync(true);
+                }
+                break;
+            case HitKind::BtnOpenUpdate:
+                OpenUpdateDialog(false);
+                break;
             case HitKind::BtnReset: {
                 std::string k_apk = cfg.apk_path, k_ro = cfg.readonly_files_dir;
                 std::string k_ud = cfg.userdata_dir, k_wb = cfg.work_bins_dir;
@@ -1662,6 +2218,7 @@ public:
                 sp_vsync.target = cfg.vsync ? 1.0f : 0.0f;
                 sp_menu_fps.target = cfg.unlock_menu_fps ? 1.0f : 0.0f;
                 sp_verbose.target = cfg.verbose_logs ? 1.0f : 0.0f;
+                sp_auto_update.target = cfg.auto_install_updates ? 1.0f : 0.0f;
                 dirty = true;
                 UpdateTabVisibility();
                 SetToast(L"Defaults restored", kColGreen);
@@ -1718,9 +2275,38 @@ public:
                 SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(h_icon_large));
                 SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(h_icon_small));
                 CreateControls();
+                CleanupLeftoverUpdateFiles(GetExecutableDir());
                 if (!screenshot_out.empty()) {
                     SetTimer(hwnd, 1, 200, nullptr);
+                } else if (!disable_update_check && (cfg.auto_check_updates || !update_popup_screenshot.empty())) {
+                    StartUpdateCheckAsync(!update_popup_screenshot.empty());
                 }
+                return 0;
+            }
+            case WM_APP_UPDATE_CHECK_DONE: {
+                update_checking = false;
+                bool manual = (wp != 0);
+                auto* info = reinterpret_cast<ReleaseInfo*>(lp);
+                if (info) {
+                    latest_release = std::move(*info);
+                    delete info;
+                }
+                if (!latest_release.ok) {
+                    update_status_line = L"v" + Utf8ToWide(effective_version) + L" · Offline";
+                    if (manual) SetToast(Utf8ToWide(latest_release.error), kColAmber);
+                } else if (latest_release.update_available) {
+                    update_status_line = L"v" + Utf8ToWide(latest_release.latest_version) + L" available";
+                    SetToast(L"Update v" + Utf8ToWide(latest_release.latest_version) + L" available", kColAmber);
+                    bool skipped = (!manual && !cfg.skipped_update_version.empty() &&
+                                    latest_release.latest_version == cfg.skipped_update_version);
+                    if (!skipped) {
+                        OpenUpdateDialog(cfg.auto_install_updates && !manual && update_popup_screenshot.empty());
+                    }
+                } else {
+                    update_status_line = L"v" + Utf8ToWide(effective_version) + L" · Up to date";
+                    if (manual) SetToast(L"You're up to date (v" + Utf8ToWide(effective_version) + L")", kColGreen);
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
             case WM_TIMER: {
@@ -1819,6 +2405,7 @@ public:
                 break;
             }
             case WM_DESTROY:
+                alive_flag->store(false, std::memory_order_release);
                 if (anim_timer_on) KillTimer(hwnd, 2);
                 if (h_ui_font) DeleteObject(h_ui_font);
                 if (h_mono_font) DeleteObject(h_mono_font);
@@ -1847,6 +2434,11 @@ bool RunLauncherUi(const LauncherOptions& opts, PcConfig& out_cfg) {
     app.config_path = opts.config_path.empty() ? ResolveDefaultConfigPath() : opts.config_path;
     app.active_tab = std::clamp(opts.initial_tab, 0, 3);
     app.screenshot_out = opts.screenshot_out;
+    app.update_popup_screenshot = opts.update_popup_screenshot;
+    app.disable_update_check = opts.disable_update_check;
+    if (!opts.simulate_version.empty()) {
+        app.effective_version = opts.simulate_version;
+    }
 
     app.cfg = LoadConfig(app.config_path);
     SaveDefaultConfigIfMissing(app.config_path, app.cfg);
