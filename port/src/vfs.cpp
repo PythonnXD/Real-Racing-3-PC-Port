@@ -116,13 +116,48 @@ std::filesystem::path LayeredVfs::ResolveRead(std::string_view android_path) con
 
     std::string rel;
     if (StripToRelative(p, rel)) {
+        std::error_code ec;
         auto overlay = userdata_dir_ / std::filesystem::path(rel);
-        if (std::filesystem::exists(overlay)) {
+        if (std::filesystem::exists(overlay, ec)) {
             return overlay;
         }
         auto ro = readonly_files_dir_ / std::filesystem::path(rel);
-        if (std::filesystem::exists(ro)) {
+        if (std::filesystem::exists(ro, ec)) {
             return ro;
+        }
+        // Cross-tier GUI asset fallback: if a user's .depot only ships one gui_assets/<W>x<H>/ pack
+        // (e.g. Project Resurrection's 2048x1536 pack or a 960x640 backup), fall back to the
+        // installed tier so missing textures never return NULL or stall AssetDownloadService.
+        static constexpr const char* kGuiPrefixes[] = {
+            ".depot/gui_assets/",
+            "apk/res/gui_assets/",
+        };
+        for (const char* gpref : kGuiPrefixes) {
+            const size_t glen = std::strlen(gpref);
+            if (rel.rfind(gpref, 0) == 0 && rel.size() > glen) {
+                const size_t slash = rel.find('/', glen);
+                if (slash != std::string::npos && slash + 1 < rel.size()) {
+                    const std::string req_tier = rel.substr(glen, slash - glen);
+                    if (req_tier == "2048x1536" || req_tier == "960x640" || req_tier == "480x320") {
+                        const std::string rest = rel.substr(slash + 1);
+                        const char* candidates[] = {
+                            preferred_gui_tier_.empty() ? nullptr : preferred_gui_tier_.c_str(),
+                            "2048x1536",
+                            "960x640",
+                            "480x320",
+                        };
+                        for (const char* cand : candidates) {
+                            if (!cand || req_tier == cand) continue;
+                            std::string alt_rel = std::string(gpref) + cand + "/" + rest;
+                            auto alt_ov = userdata_dir_ / std::filesystem::path(alt_rel);
+                            if (std::filesystem::exists(alt_ov, ec)) return alt_ov;
+                            auto alt_ro = readonly_files_dir_ / std::filesystem::path(alt_rel);
+                            if (std::filesystem::exists(alt_ro, ec)) return alt_ro;
+                        }
+                    }
+                }
+                break;
+            }
         }
         // Default to overlay path if neither exists yet
         return overlay;

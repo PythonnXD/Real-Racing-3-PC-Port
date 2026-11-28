@@ -1783,6 +1783,11 @@ void BionicRuntime::RegisterAll() {
     });
     fn("mkdir", [this](CpuContext& c) {
         const char* p = reinterpret_cast<const char*>(c.GetX(0));
+        if (p && (std::strcmp(p, "/storage") == 0 || std::strcmp(p, "/storage/") == 0 ||
+                  std::strcmp(p, "/storage/rr3") == 0 || std::strcmp(p, "/storage/rr3/") == 0)) {
+            c.SetW(0, 0u);
+            return;
+        }
         auto hp = p ? vfs_.ResolveWrite(p) : std::filesystem::path();
         if (hp.empty()) { tls_bionic_errno = 13; c.SetW(0, static_cast<uint32_t>(-1)); return; }
         std::error_code ec;

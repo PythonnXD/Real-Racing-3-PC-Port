@@ -71,6 +71,24 @@ Tested on Real Racing 3 v14.0.1 (`arm64-v8a`).
 ### Can it work with other versions of Real Racing 3?
 Untested. Other `arm64-v8a` builds may boot, though some PC patches are locked to the tested binary so unknown builds don't break. 32-bit `armeabi-v7a` APKs won't work.
 
+### Can I play Project Resurrection with this?
+Yes. Point **Data folder** at your extracted Project Resurrection `com.ea.games.r3_row` folder and select a matching `arm64-v8a` APK in **Files & saves**. The port detects the pack's texture format and `2048x1536` UI assets on startup.
+
+### What GPU file of the game does it need?
+Any of them. The port scans your `.depot` folder on startup and works with Adreno (`.atc.dds.z`), Mali (`.etc.dds.z`), Xclipse/Tegra (`.dxt.dds.z`), and PowerVR (`.ptc.pvr.z`) packs. You do not need to match the Android GPU variant to your PC graphics card.
+
+If you have a choice, Adreno is the most tested so far, and DXT packs decode directly on your PC GPU while Adreno, Mali, and PowerVR decode on the CPU as textures load.
+
+### Why do I get stuck on the downloading assets screen?
+If you already have the full game data and still get stuck on "Downloading assets", check these:
+
+- Update to the latest release. Older builds only exposed Adreno textures and capped UI detection at `1080p`, which caused Mali, Xclipse, PowerVR, and `2048x1536` phone backups to get stuck looking for missing files.
+- Make sure your APK and `com.ea.games.r3_row` backup come from the same game build. If the build ID inside `.depot/asset_list_base.txtCache.txt` does not match the APK, the game treats the local files as outdated and tries to re-download them.
+- Keep your APK path set in **Files & saves**. If your backup only copied `.depot` without `files/apk/res/`, the port needs the APK to unpack its internal resource files into `userdata/apk/res/`.
+- Double-check that your selected **Data folder** points to `com.ea.games.r3_row` (with `files\.depot` inside) and that the archive finished extracting cleanly.
+
+Turning on **Verbose logs** under **Graphics** prints a `[RR3] Depot profile:` line on startup showing the detected GPU format, UI tier, `apk_res` status, and `cache_build` ID, which helps narrow down what mismatched.
+
 ### Is it done?
 Playable offline from menus through full races. Online modes stay disabled, and fixes are still ongoing.
 

@@ -40,8 +40,11 @@ void TestVfsReadOnlyIsolation() {
     const std::filesystem::path ro = R"(d:\Real Racing 3\com.ea.games.r3_row\files)";
     vfs.Initialize(ro, tmp_ud);
 
-    // Reading existing asset resolves to read-only .depot
+    // Reading existing asset resolves to read-only .depot or apk/res
     auto shader = vfs.ResolveRead("/storage/rr3/.depot/Shaders/2dimage.vsh");
+    if (!std::filesystem::exists(shader)) {
+        shader = vfs.ResolveRead("/storage/rr3/apk/res/Shaders/2dimage.vsh");
+    }
     CHECK(std::filesystem::exists(shader));
 
     // Writing redirects strictly to userdata_dir, never readonly_files_dir
@@ -90,11 +93,13 @@ void TestAapcs64FormattingAndStat() {
     CHECK(written == 11);
     CHECK(std::strcmp(out_buf, "RR3 60 3.14") == 0);
 
-    // Call guest stat thunk on real shader file
+    // Call guest stat thunk on real shader file (.depot or apk/res depending on pack layout)
     uint64_t stat_stub = loader.FindHostSymbol("stat");
     CHECK(stat_stub != 0);
     BionicStat64 st{};
-    const char* p = "/storage/rr3/.depot/Shaders/2dimage.vsh";
+    const char* p = std::filesystem::exists(vfs.ResolveRead("/storage/rr3/.depot/Shaders/2dimage.vsh"))
+                        ? "/storage/rr3/.depot/Shaders/2dimage.vsh"
+                        : "/storage/rr3/apk/res/Shaders/2dimage.vsh";
     int rc = static_cast<int>(cpu.CallGuest(stat_stub, {reinterpret_cast<uint64_t>(p), reinterpret_cast<uint64_t>(&st)}));
     CHECK(rc == 0);
     CHECK(st.st_size == 342);
@@ -305,6 +310,47 @@ void TestAarch64StringMemStubsAndMergedDir() {
     std::printf("  [PASS] test_aarch64_string_mem_stubs_and_merged_dir\n");
 }
 
+void TestVfsGuiTierFallbackAndMkdir() {
+    auto tmp_ro = std::filesystem::temp_directory_path() / "rr3_test_gui_ro";
+    auto tmp_ud = std::filesystem::temp_directory_path() / "rr3_test_gui_ud";
+    std::filesystem::remove_all(tmp_ro);
+    std::filesystem::remove_all(tmp_ud);
+    std::filesystem::create_directories(tmp_ro / ".depot/gui_assets/2048x1536");
+    std::filesystem::create_directories(tmp_ro / ".depot/gui_assets/960x640");
+    { std::ofstream f(tmp_ro / ".depot/gui_assets/2048x1536/hud.atlas"); f << "hi"; }
+    { std::ofstream f(tmp_ro / ".depot/gui_assets/960x640/exact.atlas"); f << "mid"; }
+
+    LayeredVfs vfs;
+    vfs.Initialize(tmp_ro, tmp_ud);
+    vfs.SetPreferredGuiTier("2048x1536");
+
+    // Missing 960x640/hud.atlas falls back cleanly to installed 2048x1536/hud.atlas
+    auto fb = vfs.ResolveRead("/storage/rr3/.depot/gui_assets/960x640/hud.atlas");
+    CHECK(std::filesystem::exists(fb));
+    CHECK(fb.generic_string().find("2048x1536/hud.atlas") != std::string::npos);
+
+    // Existing 960x640/exact.atlas resolves directly without fallback
+    auto ex = vfs.ResolveRead("/storage/rr3/.depot/gui_assets/960x640/exact.atlas");
+    CHECK(std::filesystem::exists(ex));
+    CHECK(ex.generic_string().find("960x640/exact.atlas") != std::string::npos);
+
+    // Virtual /storage and /storage/rr3 mkdir succeeds cleanly instead of EACCES
+    CpuRuntime cpu;
+    ElfLoader loader(cpu);
+    BionicRuntime bionic(cpu, loader, vfs);
+    bionic.RegisterAll();
+    uint64_t fn_mkdir = loader.FindHostSymbol("mkdir");
+    CHECK(fn_mkdir != 0);
+    const char* s1 = "/storage";
+    const char* s2 = "/storage/rr3";
+    CHECK(static_cast<int>(cpu.CallGuest(fn_mkdir, {reinterpret_cast<uint64_t>(s1), 0755})) == 0);
+    CHECK(static_cast<int>(cpu.CallGuest(fn_mkdir, {reinterpret_cast<uint64_t>(s2), 0755})) == 0);
+
+    std::filesystem::remove_all(tmp_ro);
+    std::filesystem::remove_all(tmp_ud);
+    std::printf("  [PASS] test_vfs_gui_tier_fallback_and_mkdir\n");
+}
+
 } // namespace
 
 int main() {
@@ -312,6 +358,7 @@ int main() {
     TestAapcs64FormattingAndStat();
     TestPthreadAndEmutls();
     TestAarch64StringMemStubsAndMergedDir();
+    TestVfsGuiTierFallbackAndMkdir();
     TestRr3InitArrays();
     std::printf("test_bionic_vfs ALL PASSED\n");
     return 0;

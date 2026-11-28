@@ -33,6 +33,8 @@ public:
         quality_preset_ = enabled ? QualityPreset::Ultra : QualityPreset::High;
     }
     void SetApkPath(const std::filesystem::path& apk_path) { apk_path_ = apk_path; }
+    void SetPreferredGuiTier(const std::string& tier_dir) { preferred_gui_tier_ = tier_dir; }
+    const std::string& PreferredGuiTier() const { return preferred_gui_tier_; }
     bool IsVirtualPath(std::string_view android_path) const;
     const std::filesystem::path& ReadonlyFilesDir() const { return readonly_files_dir_; }
     const std::filesystem::path& UserdataDir() const { return userdata_dir_; }
@@ -44,5 +46,6 @@ private:
     std::filesystem::path userdata_dir_;
     std::filesystem::path proc_dir_;
     std::filesystem::path apk_path_;
+    std::string preferred_gui_tier_;
     QualityPreset quality_preset_ = QualityPreset::Ultra;
 };

@@ -114,6 +114,42 @@ void ApplyPortableDefaultPaths(PcConfig& cfg) {
                 break;
             }
         }
+        // Fallback: auto-detect any RR3 *.apk (e.g. "RR3 v14.0.1_row.apk") in base/parent/data root.
+        if (cfg.apk_path.empty()) {
+            const std::filesystem::path search_dirs[] = {
+                base_dir,
+                base_dir / "..",
+                std::filesystem::path(cfg.readonly_files_dir).parent_path().parent_path(),
+            };
+            std::filesystem::path first_apk;
+            std::filesystem::path rr3_apk;
+            for (const auto& dir : search_dirs) {
+                ec.clear();
+                if (!std::filesystem::is_directory(dir, ec)) continue;
+                for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+                    if (ec) break;
+                    if (!entry.is_regular_file(ec)) continue;
+                    std::string ext = ToLower(entry.path().extension().string());
+                    if (ext != ".apk") continue;
+                    std::string name = ToLower(entry.path().filename().string());
+                    if (name.find("rr3") != std::string::npos ||
+                        name.find("r3_row") != std::string::npos ||
+                        name.find("realracing") != std::string::npos) {
+                        rr3_apk = entry.path().lexically_normal();
+                        break;
+                    }
+                    if (first_apk.empty()) {
+                        first_apk = entry.path().lexically_normal();
+                    }
+                }
+                if (!rr3_apk.empty()) break;
+            }
+            if (!rr3_apk.empty()) {
+                cfg.apk_path = rr3_apk.string();
+            } else if (!first_apk.empty()) {
+                cfg.apk_path = first_apk.string();
+            }
+        }
     }
 }
 

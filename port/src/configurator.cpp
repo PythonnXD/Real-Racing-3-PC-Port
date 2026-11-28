@@ -1394,8 +1394,7 @@ public:
             bool ready = data_status.has_libs && data_status.has_depot;
             Gdiplus::SolidBrush dot(ToGdip(ready ? kColGreen : kColAmber));
             g.FillEllipse(&dot, Sf(static_cast<float>(kContentX + 18)), Sf(244.0f), Sf(7.0f), Sf(7.0f));
-            std::wstring st_main = ready ? L"Engine libraries verified (14.0.1) and game assets found"
-                                         : Utf8ToWide(data_status.summary);
+            std::wstring st_main = Utf8ToWide(data_status.summary);
             draw_txt(kContentX + 34, 226, kContentW - 50, 44, st_main.c_str(), f_sub, ready ? br_text : br_sec);
 
             // Section: Save data (y=298..452)
@@ -1575,6 +1574,12 @@ public:
                 UpdateWindow(hwnd);
                 std::string st;
                 bool ok = ExtractArm64LibsFromApk(cfg.apk_path, cfg.work_bins_dir, st);
+                if (ok) {
+                    std::string res_st;
+                    if (EnsureApkResExtracted(cfg.apk_path, cfg.readonly_files_dir, cfg.userdata_dir, res_st)) {
+                        st += "\n" + res_st;
+                    }
+                }
                 data_status = CheckGameDataStatus(cfg);
                 if (ok) {
                     SaveConfig(config_path, cfg);

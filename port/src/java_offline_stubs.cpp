@@ -143,9 +143,10 @@ void RegisterOfflineStubs(ElfLoader& loader, FakeJvm& jvm, FiremintRuntime& fire
         d.static_methods["setIsUsingImmersiveMode"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
         d.static_methods["canCallSuspendResume"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
         d.static_methods["startDownloadService"] = [](FakeJvm&, uint64_t, const auto&) {
-            if (IsVerboseLogging()) {
-                std::fprintf(stdout, "[OFFLINE] CC_Component.startDownloadService() suppressed (offline mode)\n");
-            }
+            std::fprintf(stderr,
+                         "[OFFLINE] RR3 requested asset download (suppressed in offline mode). "
+                         "If stuck on 'Downloading assets', check that your com.ea.games.r3_row/.depot "
+                         "has all game assets downloaded and matches your APK version.\n");
             return JniVal::Void();
         };
         d.static_methods["stopDownloadService"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };

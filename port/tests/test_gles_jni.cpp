@@ -212,6 +212,154 @@ void test_fake_jvm_roundtrip() {
     VirtualFree(page, 0, MEM_RELEASE);
 }
 
+void test_multi_gpu_extensions_and_decoders() {
+    // 1. Verify guest GL_EXTENSIONS curation for all 4 RR3 GPU texture packs
+    {
+        SDL_SetMainReady();
+        CHECK(SDL_Init(SDL_INIT_VIDEO) == 0);
+        SDL_Window* win = SDL_CreateWindow("RR3 Multi-GPU Test", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+                                           160, 120, SDL_WINDOW_HIDDEN);
+        CHECK(win != nullptr);
+        SDL_SysWMinfo wm{};
+        SDL_VERSION(&wm.version);
+        CHECK(SDL_GetWindowWMInfo(win, &wm));
+
+        PcConfig cfg{};
+        cfg.width = 160;
+        cfg.height = 120;
+        cfg.render_scale = 1.0f;
+        cfg.vsync = false;
+
+        auto probe_ext = [&](DepotGpuFormat fmt) -> std::string {
+            CpuRuntime cpu;
+            GlesBridge gles(cpu);
+            gles.SetTargetGpuFormat(fmt);
+            CHECK(gles.Init(wm.info.win.window, 160, 120, cfg));
+            std::string ext = gles.GuestExtensions();
+            gles.Shutdown();
+            return ext;
+        };
+
+        const std::string ext_atc = probe_ext(DepotGpuFormat::Atc);
+        CHECK(ext_atc.find("GL_AMD_compressed_ATC_texture") != std::string::npos);
+        CHECK(ext_atc.find("GL_OES_compressed_ETC1_RGB8_texture") != std::string::npos);
+        CHECK(ext_atc.find("GL_IMG_texture_compression_pvrtc") == std::string::npos);
+        CHECK(ext_atc.find("texture_compression_s3tc") == std::string::npos);
+
+        const std::string ext_etc = probe_ext(DepotGpuFormat::Etc);
+        CHECK(ext_etc.find("GL_OES_compressed_ETC1_RGB8_texture") != std::string::npos);
+        CHECK(ext_etc.find("GL_AMD_compressed_ATC_texture") == std::string::npos);
+        CHECK(ext_etc.find("GL_IMG_texture_compression_pvrtc") == std::string::npos);
+        CHECK(ext_etc.find("texture_compression_s3tc") == std::string::npos);
+        CHECK(ext_etc.find("texture_compression_dxt") == std::string::npos);
+
+        const std::string ext_dxt = probe_ext(DepotGpuFormat::Dxt);
+        CHECK(ext_dxt.find("GL_EXT_texture_compression_s3tc") != std::string::npos);
+        CHECK(ext_dxt.find("GL_EXT_texture_compression_dxt1") != std::string::npos);
+        CHECK(ext_dxt.find("GL_ANGLE_texture_compression_dxt3") != std::string::npos);
+        CHECK(ext_dxt.find("GL_ANGLE_texture_compression_dxt5") != std::string::npos);
+        CHECK(ext_dxt.find("GL_OES_compressed_ETC1_RGB8_texture") != std::string::npos);
+        CHECK(ext_dxt.find("GL_AMD_compressed_ATC_texture") == std::string::npos);
+        CHECK(ext_dxt.find("GL_IMG_texture_compression_pvrtc") == std::string::npos);
+
+        const std::string ext_pvr = probe_ext(DepotGpuFormat::Pvrtc);
+        CHECK(ext_pvr.find("GL_IMG_texture_compression_pvrtc") != std::string::npos);
+        CHECK(ext_pvr.find("GL_OES_compressed_ETC1_RGB8_texture") != std::string::npos);
+        CHECK(ext_pvr.find("GL_AMD_compressed_ATC_texture") == std::string::npos);
+        CHECK(ext_pvr.find("texture_compression_s3tc") == std::string::npos);
+
+        SDL_DestroyWindow(win);
+        SDL_Quit();
+    }
+
+    // 2. Verify CPU DXT1 (4-color + punch-through), DXT3, and DXT5 decoders
+    {
+        std::vector<uint8_t> rgba;
+        // DXT1 4-color: c0=0xF800 (red), c1=0x001F (blue), pixels 0..3 -> indices 0,1,2,3
+        const uint8_t dxt1_4col[8] = {0x00, 0xF8, 0x1F, 0x00, 0xE4, 0x00, 0x00, 0x00};
+        CHECK(GlesBridge::DecodeCompressedTextureToRgba(0x83F1u, 4, 4, dxt1_4col, 8, rgba));
+        CHECK(rgba.size() == 64);
+        CHECK(rgba[0] == 255 && rgba[1] == 0 && rgba[2] == 0 && rgba[3] == 255);     // idx 0 = red
+        CHECK(rgba[4] == 0 && rgba[5] == 0 && rgba[6] == 255 && rgba[7] == 255);     // idx 1 = blue
+        CHECK(rgba[8] == 170 && rgba[9] == 0 && rgba[10] == 85 && rgba[11] == 255);  // idx 2 = 2/3 red + 1/3 blue
+        CHECK(rgba[12] == 85 && rgba[13] == 0 && rgba[14] == 170 && rgba[15] == 255);// idx 3 = 1/3 red + 2/3 blue
+
+        // DXT1 3-color + punch-through (c0=0x001F <= c1=0xF800): idx 3 = transparent black on RGBA, opaque black on RGB
+        const uint8_t dxt1_punch[8] = {0x1F, 0x00, 0x00, 0xF8, 0xE4, 0x00, 0x00, 0x00};
+        CHECK(GlesBridge::DecodeCompressedTextureToRgba(0x83F1u, 4, 4, dxt1_punch, 8, rgba));
+        CHECK(rgba[12] == 0 && rgba[13] == 0 && rgba[14] == 0 && rgba[15] == 0);
+        CHECK(GlesBridge::DecodeCompressedTextureToRgba(0x83F0u, 4, 4, dxt1_punch, 8, rgba));
+        CHECK(rgba[12] == 0 && rgba[13] == 0 && rgba[14] == 0 && rgba[15] == 255);
+
+        // DXT3: explicit 4-bit alpha (px0=0x0->0, px1=0x8->136, px2=0xF->255) + 4-color RGB
+        uint8_t dxt3[16]{};
+        dxt3[0] = 0x80; dxt3[1] = 0x0F;
+        std::memcpy(dxt3 + 8, dxt1_4col, 8);
+        CHECK(GlesBridge::DecodeCompressedTextureToRgba(0x83F2u, 4, 4, dxt3, 16, rgba));
+        CHECK(rgba[3] == 0 && rgba[7] == 136 && rgba[11] == 255 && rgba[0] == 255);
+
+        // DXT5: interpolated alpha (a0=200, a1=60 -> idx0=200, idx1=60, idx2=180)
+        uint8_t dxt5[16]{};
+        dxt5[0] = 200; dxt5[1] = 60;
+        // 3-bit indices for px0=0, px1=1, px2=2: bits = 0 | (1<<3) | (2<<6) = 0x88
+        dxt5[2] = 0x88;
+        std::memcpy(dxt5 + 8, dxt1_4col, 8);
+        CHECK(GlesBridge::DecodeCompressedTextureToRgba(0x83F3u, 4, 4, dxt5, 16, rgba));
+        CHECK(rgba[3] == 200 && rgba[7] == 60 && rgba[11] == 180);
+    }
+
+    // 3. Verify CPU PVRTC1 4bpp & 2bpp RGB/RGBA decoders (including small mip & punch-through)
+    {
+        auto write_u32 = [](uint8_t* p, uint32_t v) {
+            p[0] = static_cast<uint8_t>(v & 0xFF);
+            p[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+            p[2] = static_cast<uint8_t>((v >> 16) & 0xFF);
+            p[3] = static_cast<uint8_t>((v >> 24) & 0xFF);
+        };
+
+        // 4bpp 8x8 (4 blocks = 32 bytes): Color A = opaque red (31,0,0), Color B = opaque blue (0,0,31)
+        const uint32_t col_red_blue = 0x8000u | (31u << 10) | 0x80000000u | (31u << 16);
+        // First 4 pixels in each block: mod codes 0, 3, 1, 2 -> bits = 0 | (3<<2) | (1<<4) | (2<<6) = 0x9C
+        uint8_t pvr4[32]{};
+        for (int b = 0; b < 4; ++b) {
+            write_u32(pvr4 + b * 8, 0x0000009Cu);
+            write_u32(pvr4 + b * 8 + 4, col_red_blue);
+        }
+        std::vector<uint8_t> rgba;
+        CHECK(GlesBridge::DecodeCompressedTextureToRgba(0x8C02u, 8, 8, pvr4, 32, rgba));
+        CHECK(rgba.size() == 8 * 8 * 4);
+        CHECK(rgba[0] == 255 && rgba[1] == 0 && rgba[2] == 0 && rgba[3] == 255);      // mod 0 -> A (red)
+        CHECK(rgba[4] == 0 && rgba[5] == 0 && rgba[6] == 255 && rgba[7] == 255);      // mod 3 -> B (blue)
+        CHECK(rgba[8] == 159 && rgba[9] == 0 && rgba[10] == 95 && rgba[11] == 255);   // mod 1 -> 5/8 A + 3/8 B
+        CHECK(rgba[12] == 95 && rgba[13] == 0 && rgba[14] == 159 && rgba[15] == 255); // mod 2 -> 3/8 A + 5/8 B
+
+        // 4bpp punch-through mode (bit0=1, code 2 -> alpha=0 on RGBA, alpha=255 on RGB)
+        uint8_t pvr4_pt[32]{};
+        for (int b = 0; b < 4; ++b) {
+            write_u32(pvr4_pt + b * 8, 0x0000009Cu);
+            write_u32(pvr4_pt + b * 8 + 4, col_red_blue | 1u);
+        }
+        CHECK(GlesBridge::DecodeCompressedTextureToRgba(0x8C02u, 4, 4, pvr4_pt, 32, rgba));
+        CHECK(rgba.size() == 4 * 4 * 4);
+        CHECK(rgba[12] == 127 && rgba[14] == 127 && rgba[15] == 0);
+        CHECK(GlesBridge::DecodeCompressedTextureToRgba(0x8C00u, 4, 4, pvr4_pt, 32, rgba));
+        CHECK(rgba[15] == 255);
+
+        // 2bpp 16x8 (4 blocks = 32 bytes): mode 0, px0=0 (A red), px1=1 (B blue)
+        uint8_t pvr2[32]{};
+        for (int b = 0; b < 4; ++b) {
+            write_u32(pvr2 + b * 8, 0x00000002u);
+            write_u32(pvr2 + b * 8 + 4, col_red_blue);
+        }
+        CHECK(GlesBridge::DecodeCompressedTextureToRgba(0x8C03u, 16, 8, pvr2, 32, rgba));
+        CHECK(rgba.size() == 16 * 8 * 4);
+        CHECK(rgba[0] == 255 && rgba[2] == 0 && rgba[3] == 255);
+        CHECK(rgba[4] == 0 && rgba[6] == 255 && rgba[7] == 255);
+    }
+
+    std::printf("  [PASS] test_multi_gpu_extensions_and_decoders (ATC/ETC1/DXT/PVRTC ext curation + DXT1/3/5 & PVRTC1 4bpp/2bpp decoders)\n");
+}
+
 } // namespace
 
 int main() {
@@ -219,6 +367,7 @@ int main() {
     setvbuf(stderr, nullptr, _IONBF, 0);
     test_angle_and_guest_gl();
     test_fake_jvm_roundtrip();
+    test_multi_gpu_extensions_and_decoders();
     std::printf("test_gles_jni ALL PASSED\n");
     return 0;
 }

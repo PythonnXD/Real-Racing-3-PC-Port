@@ -465,7 +465,7 @@ void TestConfigQualityVerboseAndDistTools() {
     CHECK(std::fabs(in_cfg.render_scale - 1.25f) < 0.01f);
     CHECK(in_cfg.anisotropy == 8);
 
-    // 2. Verify all 4 native Android quality profile files exist in stock .depot
+    // 2. Verify all 4 native Android quality profile files exist in stock .depot or apk/res
     const fs::path stock_ro = R"(d:\Real Racing 3\com.ea.games.r3_row\files)";
     if (fs::is_directory(stock_ro / ".depot", ec)) {
         LayeredVfs vfs;
@@ -473,7 +473,9 @@ void TestConfigQualityVerboseAndDistTools() {
         for (QualityPreset qp : {QualityPreset::Low, QualityPreset::Medium, QualityPreset::High, QualityPreset::Ultra}) {
             std::string stem = QualityPresetToAndroidStem(qp);
             auto p1 = vfs.ResolveRead("/storage/rr3/.depot/eds/" + stem + ".plist");
+            if (!fs::is_regular_file(p1, ec)) p1 = vfs.ResolveRead("/storage/rr3/apk/res/eds/" + stem + ".plist");
             auto p2 = vfs.ResolveRead("/storage/rr3/.depot/feats/" + stem + ".feats");
+            if (!fs::is_regular_file(p2, ec)) p2 = vfs.ResolveRead("/storage/rr3/apk/res/feats/" + stem + ".feats");
             CHECK(fs::is_regular_file(p1, ec));
             CHECK(fs::is_regular_file(p2, ec));
         }
@@ -530,16 +532,57 @@ void TestConfigQualityVerboseAndDistTools() {
         CHECK(content == "SAVE_V2_IMPORTED");
     }
 
-    // 4. APK extractor + BCrypt SHA-256 verification against stock read-only APK
-    const fs::path stock_apk = R"(d:\Real Racing 3\RR3 14.0.1.apk)";
+    // 4. APK extractor + BCrypt SHA-256 + res/xR.zip extraction against stock read-only APK
+    fs::path stock_apk = R"(d:\Real Racing 3\RR3 14.0.1.apk)";
+    if (!fs::is_regular_file(stock_apk, ec)) {
+        stock_apk = R"(d:\Real Racing 3\RR3 v14.0.1_row.apk)";
+    }
     if (fs::is_regular_file(stock_apk, ec)) {
         const fs::path ext_dir = tmp / "extracted_libs";
         CHECK(ExtractArm64LibsFromApk(stock_apk, ext_dir, msg));
         CHECK(ComputeFileSha256Hex(ext_dir / "libRealRacing3.so") == kExpectedRr3SoSha256);
+
+        // Verify res/xR.zip auto-unpacks into userdata/apk/res without touching readonly_files_dir
+        const fs::path empty_ro = tmp / "empty_ro";
+        const fs::path res_ud = tmp / "res_ud";
+        fs::create_directories(empty_ro / ".depot", ec);
+        CHECK(EnsureApkResExtracted(stock_apk, empty_ro, res_ud, msg));
+        CHECK(fs::is_regular_file(res_ud / "apk" / "res" / "asset_list_base.txt", ec));
+        CHECK(fs::is_regular_file(res_ud / "apk" / "res" / "Shaders" / "2dimage.vsh", ec));
+        CHECK(fs::file_size(res_ud / "apk" / "res" / "Shaders" / "2dimage.vsh", ec) == 342);
+        CHECK(!fs::exists(empty_ro / "apk", ec));
+    }
+
+    // 5. DetectDepotProfile across all 4 GPU packs (Adreno/Mali/Xclipse/PowerVR) and 3 GUI tiers
+    {
+        auto make_pack = [&](const char* name, const char* tex_ext, const char* gui_tier) -> DepotProfile {
+            const fs::path root = tmp / name;
+            fs::create_directories(root / ".depot" / "gui_assets" / gui_tier, ec);
+            fs::create_directories(root / ".depot" / "vehicles", ec);
+            for (int i = 0; i < 6; ++i) {
+                std::ofstream f(root / ".depot" / "gui_assets" / gui_tier / ("ui_" + std::to_string(i) + tex_ext));
+                f << "x";
+            }
+            {
+                std::ofstream cf(root / ".depot" / "asset_list_base.txtCache.txt", std::ios::binary);
+                const uint8_t hdr[8] = {0x9d, 0xf3, 0xf6, 0xa4, 0x04, 0x00, 0x00, 0x00};
+                cf.write(reinterpret_cast<const char*>(hdr), 8);
+                cf << "7469\n";
+            }
+            return DetectDepotProfile(root, tmp / (std::string(name) + "_ud"));
+        };
+        auto p_atc = make_pack("pack_adreno", ".atc.dds.z", "2048x1536");
+        CHECK(p_atc.gpu_format == DepotGpuFormat::Atc && p_atc.gui_tier == DepotGuiTier::Res2048x1536 && p_atc.cache_build_id == "7469");
+        auto p_etc = make_pack("pack_mali", ".etc.dds.z", "960x640");
+        CHECK(p_etc.gpu_format == DepotGpuFormat::Etc && p_etc.gui_tier == DepotGuiTier::Res960x640);
+        auto p_dxt = make_pack("pack_xclipse", ".dxt.dds.z", "480x320");
+        CHECK(p_dxt.gpu_format == DepotGpuFormat::Dxt && p_dxt.gui_tier == DepotGuiTier::Res480x320);
+        auto p_pvr = make_pack("pack_powervr", ".ptc.pvr.z", "2048x1536");
+        CHECK(p_pvr.gpu_format == DepotGpuFormat::Pvrtc && p_pvr.gui_tier == DepotGuiTier::Res2048x1536);
     }
 
     fs::remove_all(tmp, ec);
-    std::printf("  [PASS] test_config_quality_verbose_and_dist_tools (Quality Low..Ultra VFS, Verbose INI, Save Import/Export+Backup, APK SHA-256)\n");
+    std::printf("  [PASS] test_config_quality_verbose_and_dist_tools (Quality Low..Ultra VFS, Verbose INI, Save Import/Export+Backup, APK libs+res, 4-GPU DepotProfile)\n");
 }
 
 } // namespace

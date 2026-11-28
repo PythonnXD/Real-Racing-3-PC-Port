@@ -77,7 +77,423 @@ bool CountFilesInDir(const std::filesystem::path& dir, size_t& out_count, uintma
     return true;
 }
 
+size_t CountRegularFilesCapped(const std::filesystem::path& dir, size_t cap) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) return 0;
+    size_t n = 0;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(
+             dir, std::filesystem::directory_options::skip_permission_denied, ec)) {
+        if (ec) { ec.clear(); continue; }
+        if (entry.is_regular_file(ec)) {
+            ++n;
+            if (n >= cap) break;
+        }
+    }
+    return n;
+}
+
+bool EndsWithLower(const std::string& lower_s, const char* suffix) {
+    size_t slen = std::strlen(suffix);
+    return lower_s.size() >= slen && lower_s.compare(lower_s.size() - slen, slen, suffix) == 0;
+}
+
+bool FindZipEocd(const uint8_t* data, size_t len, int64_t& out_eocd) {
+    out_eocd = -1;
+    if (len < 22) return false;
+    for (int64_t i = static_cast<int64_t>(len) - 22; i >= 0; --i) {
+        if (ReadLe32(data + i) == 0x06054b50u) {
+            uint16_t comment_len = ReadLe16(data + i + 20);
+            if (i + 22 + comment_len == static_cast<int64_t>(len)) {
+                out_eocd = i;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool ExtractZipBufferToDir(const uint8_t* zip_data,
+                           size_t zip_size,
+                           const std::filesystem::path& dest_root,
+                           size_t& out_extracted,
+                           std::string& out_err) {
+    out_extracted = 0;
+    const size_t tail_len = std::min<size_t>(zip_size, 65557);
+    const size_t tail_off = zip_size - tail_len;
+    int64_t rel_eocd = -1;
+    if (!FindZipEocd(zip_data + tail_off, tail_len, rel_eocd)) {
+        out_err = "Inner resource ZIP missing End of Central Directory.";
+        return false;
+    }
+    const size_t eocd = tail_off + static_cast<size_t>(rel_eocd);
+    const uint16_t total_entries = ReadLe16(zip_data + eocd + 10);
+    const uint32_t cd_size = ReadLe32(zip_data + eocd + 12);
+    const uint32_t cd_offset = ReadLe32(zip_data + eocd + 16);
+    if (static_cast<uint64_t>(cd_offset) + cd_size > zip_size) {
+        out_err = "Inner resource ZIP Central Directory out of bounds.";
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(dest_root, ec);
+    const auto canon_root = std::filesystem::weakly_canonical(dest_root, ec);
+    const uint8_t* cd = zip_data + cd_offset;
+    size_t pos = 0;
+
+    for (uint16_t idx = 0; idx < total_entries && pos + 46 <= cd_size; ++idx) {
+        if (ReadLe32(cd + pos) != 0x02014b50u) break;
+        const uint16_t method = ReadLe16(cd + pos + 10);
+        const uint32_t comp_sz = ReadLe32(cd + pos + 20);
+        const uint32_t uncomp_sz = ReadLe32(cd + pos + 24);
+        const uint16_t name_len = ReadLe16(cd + pos + 28);
+        const uint16_t extra_len = ReadLe16(cd + pos + 30);
+        const uint16_t comment_len = ReadLe16(cd + pos + 32);
+        const uint32_t lfh_off = ReadLe32(cd + pos + 42);
+        if (pos + 46 + name_len > cd_size) break;
+
+        std::string name(reinterpret_cast<const char*>(cd + pos + 46), name_len);
+        pos += 46 + name_len + extra_len + comment_len;
+        std::replace(name.begin(), name.end(), '\\', '/');
+        if (name.empty() || name.back() == '/') continue;
+        while (!name.empty() && name.front() == '/') name.erase(name.begin());
+        if (name.empty() || name.find("..") != std::string::npos || name.find(':') != std::string::npos) {
+            continue;
+        }
+        if (name.rfind("res/", 0) != 0) {
+            name = "res/" + name;
+        }
+
+        if (static_cast<uint64_t>(lfh_off) + 30 > zip_size) continue;
+        const uint8_t* lfh = zip_data + lfh_off;
+        if (ReadLe32(lfh) != 0x04034b50u) continue;
+        const uint64_t data_off = static_cast<uint64_t>(lfh_off) + 30 + ReadLe16(lfh + 26) + ReadLe16(lfh + 28);
+        if (data_off + comp_sz > zip_size) continue;
+
+        const uint8_t* comp_ptr = zip_data + data_off;
+        std::vector<uint8_t> decoded;
+        const uint8_t* wptr = nullptr;
+        size_t wlen = 0;
+        if (method == 0) {
+            wptr = comp_ptr;
+            wlen = comp_sz;
+        } else if (method == 8) {
+            if (!InflateRaw(comp_ptr, comp_sz, decoded, uncomp_sz)) continue;
+            wptr = decoded.data();
+            wlen = decoded.size();
+        } else {
+            continue;
+        }
+
+        const auto dst = (dest_root / std::filesystem::path(name)).lexically_normal();
+        const auto canon_dst = std::filesystem::weakly_canonical(dst, ec);
+        if (canon_dst.wstring().rfind(canon_root.wstring(), 0) != 0) continue;
+
+        if (dst.has_parent_path()) std::filesystem::create_directories(dst.parent_path(), ec);
+        std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) continue;
+        out.write(reinterpret_cast<const char*>(wptr), static_cast<std::streamsize>(wlen));
+        if (out.good()) ++out_extracted;
+    }
+
+    if (out_extracted == 0) {
+        out_err = "Inner resource ZIP contained no extractable files.";
+        return false;
+    }
+    return true;
+}
+
 } // namespace
+
+const char* DepotGpuFormatToString(DepotGpuFormat fmt) {
+    switch (fmt) {
+        case DepotGpuFormat::Atc:   return "Adreno (ATC)";
+        case DepotGpuFormat::Etc:   return "Mali (ETC1)";
+        case DepotGpuFormat::Dxt:   return "Xclipse/Tegra (DXT)";
+        case DepotGpuFormat::Pvrtc: return "PowerVR (PVRTC)";
+    }
+    return "Adreno (ATC)";
+}
+
+const char* DepotGpuDefaultRenderer(DepotGpuFormat fmt) {
+    switch (fmt) {
+        case DepotGpuFormat::Atc:   return "Adreno (TM) 740";
+        case DepotGpuFormat::Etc:   return "Mali-G715";
+        case DepotGpuFormat::Dxt:   return "Samsung Xclipse 940";
+        case DepotGpuFormat::Pvrtc: return "PowerVR Rogue GE8320";
+    }
+    return "Adreno (TM) 740";
+}
+
+const char* DepotGuiTierToDirName(DepotGuiTier tier) {
+    switch (tier) {
+        case DepotGuiTier::Res480x320:   return "480x320";
+        case DepotGuiTier::Res960x640:   return "960x640";
+        case DepotGuiTier::Res2048x1536: return "2048x1536";
+        case DepotGuiTier::Auto:         return "auto";
+    }
+    return "auto";
+}
+
+DepotProfile DetectDepotProfile(const std::filesystem::path& readonly_files_dir,
+                                const std::filesystem::path& userdata_dir) {
+    DepotProfile p;
+    std::error_code ec;
+    const auto depot = readonly_files_dir / ".depot";
+
+    p.has_apk_res =
+        std::filesystem::is_regular_file(readonly_files_dir / "apk" / "res" / "asset_list_base.txt", ec) ||
+        (!userdata_dir.empty() &&
+         std::filesystem::is_regular_file(userdata_dir / "apk" / "res" / "asset_list_base.txt", ec));
+
+    // Read build number from asset_list_base.txtCache.txt (8-byte header 0xa4f6f39d + version, then ASCII build line)
+    for (const auto& root : {userdata_dir, readonly_files_dir}) {
+        if (root.empty()) continue;
+        const auto cache_file = root / ".depot" / "asset_list_base.txtCache.txt";
+        if (std::filesystem::is_regular_file(cache_file, ec)) {
+            std::ifstream cf(cache_file, std::ios::binary);
+            uint8_t hdr[64]{};
+            cf.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+            std::streamsize got = cf.gcount();
+            if (got >= 10 && ReadLe32(hdr) == 0xa4f6f39du) {
+                std::string bid;
+                for (std::streamsize i = 8; i < got; ++i) {
+                    char ch = static_cast<char>(hdr[i]);
+                    if (ch == '\r' || ch == '\n') break;
+                    if (ch >= 32 && ch < 127) bid.push_back(ch);
+                }
+                p.cache_build_id = bid;
+            }
+            break;
+        }
+    }
+
+    if (!std::filesystem::is_directory(depot, ec)) {
+        return p;
+    }
+
+    // 1. Detect installed gui_assets resolution tier (2048x1536 vs 960x640 vs 480x320)
+    const auto gui_root = depot / "gui_assets";
+    p.gui_2048_count = CountRegularFilesCapped(gui_root / "2048x1536", 500);
+    p.gui_960_count  = CountRegularFilesCapped(gui_root / "960x640", 500);
+    p.gui_480_count  = CountRegularFilesCapped(gui_root / "480x320", 500);
+    if (!userdata_dir.empty()) {
+        const auto ud_gui = userdata_dir / ".depot" / "gui_assets";
+        p.gui_2048_count += CountRegularFilesCapped(ud_gui / "2048x1536", 500);
+        p.gui_960_count  += CountRegularFilesCapped(ud_gui / "960x640", 500);
+        p.gui_480_count  += CountRegularFilesCapped(ud_gui / "480x320", 500);
+    }
+
+    size_t best_gui = std::max({p.gui_2048_count, p.gui_960_count, p.gui_480_count});
+    if (best_gui > 0) {
+        if (p.gui_2048_count >= p.gui_960_count && p.gui_2048_count >= p.gui_480_count) {
+            p.gui_tier = DepotGuiTier::Res2048x1536;
+        } else if (p.gui_960_count >= p.gui_480_count) {
+            p.gui_tier = DepotGuiTier::Res960x640;
+        } else {
+            p.gui_tier = DepotGuiTier::Res480x320;
+        }
+    }
+
+    // 2. Bounded scan for GPU-compressed texture extensions across high-signal folders
+    size_t matched = 0;
+    size_t visited = 0;
+    auto scan_dir = [&](const std::filesystem::path& dir) {
+        if (matched >= 300 || visited >= 4000) return;
+        std::error_code lec;
+        if (!std::filesystem::is_directory(dir, lec)) return;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                 dir, std::filesystem::directory_options::skip_permission_denied, lec)) {
+            if (lec) { lec.clear(); continue; }
+            if (!entry.is_regular_file(lec)) continue;
+            ++visited;
+            std::string name = entry.path().filename().string();
+            std::transform(name.begin(), name.end(), name.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (EndsWithLower(name, ".atc.dds.z") || EndsWithLower(name, ".atc.dds")) {
+                ++p.atc_count; ++matched;
+            } else if (EndsWithLower(name, ".etc.dds.z") || EndsWithLower(name, ".etc.dds")) {
+                ++p.etc_count; ++matched;
+            } else if (EndsWithLower(name, ".dxt.dds.z") || EndsWithLower(name, ".dxt.dds")) {
+                ++p.dxt_count; ++matched;
+            } else if (EndsWithLower(name, ".ptc.pvr.z") || EndsWithLower(name, ".ptc.pvr")) {
+                ++p.pvrtc_count; ++matched;
+            }
+            if (matched >= 300 || visited >= 4000) break;
+        }
+    };
+
+    scan_dir(depot / "gui_assets");
+    scan_dir(depot / "vehicles");
+    scan_dir(depot / "Tracks");
+    scan_dir(depot / "ui");
+    if (matched == 0) {
+        scan_dir(depot);
+    }
+
+    size_t best_gpu = std::max({p.atc_count, p.etc_count, p.dxt_count, p.pvrtc_count});
+    if (best_gpu > 0) {
+        if (p.atc_count == best_gpu)        p.gpu_format = DepotGpuFormat::Atc;
+        else if (p.etc_count == best_gpu)   p.gpu_format = DepotGpuFormat::Etc;
+        else if (p.dxt_count == best_gpu)   p.gpu_format = DepotGpuFormat::Dxt;
+        else                                p.gpu_format = DepotGpuFormat::Pvrtc;
+    }
+    return p;
+}
+
+bool EnsureApkResExtracted(const std::filesystem::path& apk_path,
+                           const std::filesystem::path& readonly_files_dir,
+                           const std::filesystem::path& userdata_dir,
+                           std::string& out_status) {
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(readonly_files_dir / "apk" / "res" / "asset_list_base.txt", ec)) {
+        out_status = "APK res/ already present in game data folder.";
+        return true;
+    }
+    if (!userdata_dir.empty() &&
+        std::filesystem::is_regular_file(userdata_dir / "apk" / "res" / "asset_list_base.txt", ec)) {
+        out_status = "APK res/ already unpacked in userdata/apk/res.";
+        return true;
+    }
+    if (apk_path.empty() || !std::filesystem::is_regular_file(apk_path, ec)) {
+        out_status = "Missing files/apk/res/ and no APK found to extract res/xR.zip.";
+        return false;
+    }
+    if (userdata_dir.empty()) {
+        out_status = "No writable userdata_dir available for APK res/ extraction.";
+        return false;
+    }
+
+    std::ifstream in(apk_path, std::ios::binary | std::ios::ate);
+    if (!in.is_open()) {
+        out_status = "Could not open APK for res/ extraction.";
+        return false;
+    }
+    const int64_t file_size = static_cast<int64_t>(in.tellg());
+    if (file_size < 22) {
+        out_status = "Invalid APK size.";
+        return false;
+    }
+
+    const size_t search_len = static_cast<size_t>(std::min<int64_t>(file_size, 65557));
+    std::vector<uint8_t> tail(search_len);
+    in.seekg(file_size - static_cast<int64_t>(search_len), std::ios::beg);
+    in.read(reinterpret_cast<char*>(tail.data()), static_cast<std::streamsize>(search_len));
+
+    int64_t eocd_pos = -1;
+    if (!FindZipEocd(tail.data(), tail.size(), eocd_pos)) {
+        out_status = "Invalid APK: ZIP EOCD not found.";
+        return false;
+    }
+
+    const uint16_t total_entries = ReadLe16(tail.data() + eocd_pos + 10);
+    const uint32_t cd_size = ReadLe32(tail.data() + eocd_pos + 12);
+    const uint32_t cd_offset = ReadLe32(tail.data() + eocd_pos + 16);
+    if (static_cast<int64_t>(cd_offset) + static_cast<int64_t>(cd_size) > file_size) {
+        out_status = "Invalid APK: Central Directory out of bounds.";
+        return false;
+    }
+
+    std::vector<uint8_t> cd(cd_size);
+    in.seekg(cd_offset, std::ios::beg);
+    in.read(reinterpret_cast<char*>(cd.data()), static_cast<std::streamsize>(cd_size));
+    if (!in.good()) {
+        out_status = "Failed reading APK Central Directory.";
+        return false;
+    }
+
+    // Locate embedded inner resource zip (res/xR.zip in RR3 v14.0.1, or fallback res/*.zip >= 1 MB)
+    struct InnerZipHit {
+        std::string name;
+        uint16_t method = 0;
+        uint32_t comp_sz = 0;
+        uint32_t uncomp_sz = 0;
+        uint32_t lfh_off = 0;
+    };
+    InnerZipHit hit;
+    bool found_exact = false;
+    size_t pos = 0;
+    for (uint16_t idx = 0; idx < total_entries && pos + 46 <= cd.size(); ++idx) {
+        if (ReadLe32(cd.data() + pos) != 0x02014b50u) break;
+        const uint16_t method = ReadLe16(cd.data() + pos + 10);
+        const uint32_t comp_sz = ReadLe32(cd.data() + pos + 20);
+        const uint32_t uncomp_sz = ReadLe32(cd.data() + pos + 24);
+        const uint16_t name_len = ReadLe16(cd.data() + pos + 28);
+        const uint16_t extra_len = ReadLe16(cd.data() + pos + 30);
+        const uint16_t comment_len = ReadLe16(cd.data() + pos + 32);
+        const uint32_t lfh_off = ReadLe32(cd.data() + pos + 42);
+        if (pos + 46 + name_len > cd.size()) break;
+
+        std::string entry_name(reinterpret_cast<const char*>(cd.data() + pos + 46), name_len);
+        pos += 46 + name_len + extra_len + comment_len;
+
+        if (entry_name == "res/xR.zip") {
+            hit = {entry_name, method, comp_sz, uncomp_sz, lfh_off};
+            found_exact = true;
+            break;
+        }
+        if (!found_exact && entry_name.rfind("res/", 0) == 0 &&
+            entry_name.size() > 8 && entry_name.compare(entry_name.size() - 4, 4, ".zip") == 0 &&
+            uncomp_sz >= 1000000u && uncomp_sz > hit.uncomp_sz) {
+            hit = {entry_name, method, comp_sz, uncomp_sz, lfh_off};
+        }
+    }
+
+    if (hit.name.empty()) {
+        out_status = "No embedded resource zip (res/xR.zip) found in APK.";
+        return false;
+    }
+
+    uint8_t lfh[30]{};
+    in.seekg(hit.lfh_off, std::ios::beg);
+    in.read(reinterpret_cast<char*>(lfh), sizeof(lfh));
+    if (!in.good() || ReadLe32(lfh) != 0x04034b50u) {
+        out_status = "Corrupt ZIP header for " + hit.name;
+        return false;
+    }
+    const int64_t data_off = static_cast<int64_t>(hit.lfh_off) + 30 + ReadLe16(lfh + 26) + ReadLe16(lfh + 28);
+    if (data_off + hit.comp_sz > file_size) {
+        out_status = "Corrupt ZIP bounds for " + hit.name;
+        return false;
+    }
+
+    std::vector<uint8_t> raw(hit.comp_sz);
+    in.seekg(data_off, std::ios::beg);
+    in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(hit.comp_sz));
+    if (!in.good()) {
+        out_status = "Failed reading " + hit.name + " from APK.";
+        return false;
+    }
+
+    std::vector<uint8_t> inner_zip;
+    const uint8_t* zip_ptr = nullptr;
+    size_t zip_len = 0;
+    if (hit.method == 0) {
+        zip_ptr = raw.data();
+        zip_len = raw.size();
+    } else if (hit.method == 8) {
+        if (!InflateRaw(raw.data(), raw.size(), inner_zip, hit.uncomp_sz)) {
+            out_status = "Failed inflating " + hit.name;
+            return false;
+        }
+        zip_ptr = inner_zip.data();
+        zip_len = inner_zip.size();
+    } else {
+        out_status = "Unsupported ZIP compression method for " + hit.name;
+        return false;
+    }
+
+    size_t extracted_count = 0;
+    std::string err;
+    const auto apk_out = userdata_dir / "apk";
+    if (!ExtractZipBufferToDir(zip_ptr, zip_len, apk_out, extracted_count, err)) {
+        out_status = err;
+        return false;
+    }
+
+    out_status = "Unpacked " + std::to_string(extracted_count) + " APK resource files from " +
+                 hit.name + " into userdata/apk/res.";
+    return true;
+}
 
 std::string ComputeFileSha256Hex(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
@@ -146,6 +562,9 @@ GameDataStatus CheckGameDataStatus(const PcConfig& cfg) {
 
     const std::filesystem::path ro(cfg.readonly_files_dir);
     st.has_depot = std::filesystem::is_directory(ro / ".depot", ec);
+    if (st.has_depot) {
+        st.depot_profile = DetectDepotProfile(ro, std::filesystem::path(cfg.userdata_dir));
+    }
 
     const std::filesystem::path doc = std::filesystem::path(cfg.userdata_dir) / "doc";
     uintmax_t bytes = 0;
@@ -154,7 +573,9 @@ GameDataStatus CheckGameDataStatus(const PcConfig& cfg) {
 
     std::ostringstream oss;
     if (st.has_libs && st.hash_matches && st.has_depot) {
-        oss << "Ready to play (RR3 v14.0.1 ARM64 libraries verified + .depot assets found)";
+        oss << "Ready to play (RR3 v14.0.1 ARM64 verified · "
+            << DepotGpuFormatToString(st.depot_profile.gpu_format) << " · UI "
+            << DepotGuiTierToDirName(st.depot_profile.gui_tier) << ")";
     } else if (!st.has_libs && !st.has_depot) {
         oss << "Setup required: select your Real Racing 3 APK to extract libraries and select com.ea.games.r3_row data folder.";
     } else if (!st.has_libs) {

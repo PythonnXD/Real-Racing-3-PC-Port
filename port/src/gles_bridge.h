@@ -1,12 +1,14 @@
 #pragma once
 
 #include "config.h"
+#include "dist_tools.h"
 #include "elf_loader.h"
 
 #include <cstdint>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct HWND__;
@@ -56,8 +58,18 @@ public:
     std::string GlRenderer() const { return gl_renderer_; }
     std::string GlVersion() const { return gl_version_; }
     std::string GlExtensions() const { return gl_extensions_; }
+    std::string GuestExtensions() const { return guest_extensions_; }
     bool SupportsAnisotropy() const { return max_anisotropy_ > 1.0f; }
     float AppliedAnisotropy() const { return applied_anisotropy_; }
+
+    // Selects which GPU compressed texture extension RR3 should target (must be set before Init).
+    void SetTargetGpuFormat(DepotGpuFormat fmt) { target_gpu_format_ = fmt; }
+    DepotGpuFormat TargetGpuFormat() const { return target_gpu_format_; }
+
+    // Pure CPU compressed texture decoder (ATC, ETC1, DXT1/3/5, PVRTC1 4bpp/2bpp RGB/RGBA).
+    static bool DecodeCompressedTextureToRgba(uint32_t gl_format, int width, int height,
+                                              const uint8_t* src, int image_size,
+                                              std::vector<uint8_t>& out_rgba);
 
     // Optional override for glGetString(GL_RENDERER) if needed for preset matching.
     void SetRendererOverride(const std::string& override_str) { renderer_override_ = override_str; }
@@ -100,6 +112,9 @@ private:
     std::string gl_extensions_;
     std::string guest_extensions_;
     std::string renderer_override_;
+    DepotGpuFormat target_gpu_format_ = DepotGpuFormat::Atc;
+    bool host_supports_s3tc_ = false;
+    std::unordered_set<uint32_t> cpu_decoded_dxt_tex_;
     float max_anisotropy_ = 1.0f;
     float applied_anisotropy_ = 1.0f;
 

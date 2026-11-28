@@ -185,7 +185,8 @@ int main(int argc, char** argv) {
     int resize_frame = -1, resize_w = 0, resize_h = 0;
     double resize_sec = -1.0;
     bool resize_sec_done = false;
-    std::string renderer_override = "Adreno (TM) 740";
+    std::string renderer_override;
+    bool cli_has_renderer = false;
     std::filesystem::path config_path = ResolveDefaultConfigPath();
     bool cli_no_vsync = false;
     bool cli_profile_slow = false;
@@ -254,6 +255,7 @@ int main(int argc, char** argv) {
             cli_quality = ParseQualityPreset(argv[++i], QualityPreset::Ultra);
         } else if (arg == "--renderer" && i + 1 < argc) {
             renderer_override = argv[++i];
+            cli_has_renderer = true;
         } else if (arg == "--no-vsync") {
             cli_no_vsync = true;
         } else if (arg == "--profile-slow") {
@@ -508,9 +510,36 @@ int main(int argc, char** argv) {
     int fixed_render_h = std::max(360, native_disp.h);
 
     // ---- Core subsystems ----
+    // Ensure Android APK res/ (shaders, asset lists, core gui) exists in readonly or userdata overlay
+    {
+        std::string apk_res_status;
+        if (!EnsureApkResExtracted(cfg.apk_path, cfg.readonly_files_dir, cfg.userdata_dir, apk_res_status)) {
+            std::fprintf(stderr, "[RR3] Warning: %s\n", apk_res_status.c_str());
+        } else if (apk_res_status.rfind("Unpacked ", 0) == 0) {
+            std::fprintf(stdout, "[RR3] %s\n", apk_res_status.c_str());
+        }
+    }
+
+    const DepotProfile depot_profile = DetectDepotProfile(cfg.readonly_files_dir, cfg.userdata_dir);
+    std::fprintf(stdout,
+                 "[RR3] Depot profile: gpu=%s (atc=%zu etc=%zu dxt=%zu pvrtc=%zu) | gui=%s (2048=%zu 960=%zu 480=%zu) | apk_res=%s | cache_build=%s\n",
+                 DepotGpuFormatToString(depot_profile.gpu_format),
+                 depot_profile.atc_count, depot_profile.etc_count, depot_profile.dxt_count, depot_profile.pvrtc_count,
+                 DepotGuiTierToDirName(depot_profile.gui_tier),
+                 depot_profile.gui_2048_count, depot_profile.gui_960_count, depot_profile.gui_480_count,
+                 depot_profile.has_apk_res ? "OK" : "MISSING",
+                 depot_profile.cache_build_id.empty() ? "none" : depot_profile.cache_build_id.c_str());
+
+    if (!cli_has_renderer) {
+        renderer_override = DepotGpuDefaultRenderer(depot_profile.gpu_format);
+    }
+
     LayeredVfs vfs;
     vfs.Initialize(cfg.readonly_files_dir, cfg.userdata_dir);
     vfs.SetQualityPreset(cfg.quality_preset);
+    if (depot_profile.gui_tier != DepotGuiTier::Auto) {
+        vfs.SetPreferredGuiTier(DepotGuiTierToDirName(depot_profile.gui_tier));
+    }
     if (!cfg.apk_path.empty()) {
         vfs.SetApkPath(cfg.apk_path);
     }
@@ -528,6 +557,7 @@ int main(int argc, char** argv) {
     });
 
     GlesBridge gles(cpu);
+    gles.SetTargetGpuFormat(depot_profile.gpu_format);
     if (!gles.Init(wm.info.win.window, cur_w, cur_h, cfg, fixed_render_h)) {
         std::fprintf(stderr, "[RR3] GlesBridge::Init failed\n");
         SDL_DestroyWindow(win);
@@ -639,18 +669,52 @@ int main(int argc, char** argv) {
                  cur_w, cur_h, gles.RenderWidth(), gles.RenderHeight(),
                  cfg.vsync ? "ON" : "OFF", cfg.anisotropy);
 
-    // Clamp initial boot view size to <=1920x1080 so AssetDownloadService matches installed local
-    // .depot asset packs (prevents 535MB download prompt on 1440p/4K monitors or render_scale > 1.0).
-    // Once asset validation completes (frame 12), promote to full render_w x render_h!
+    // Match initial boot view dimensions to the installed gui_assets/<W>x<H>/ tier so both
+    // GuiResourceManager (0x10f8cf8) and AssetDownloadService (0xbec830) select the exact GUI pack
+    // present in .depot (prevents StatusIconBar null-texture crash on 2048x1536 packs AND prevents
+    // false "Downloading assets" stalls on any monitor resolution). Promote to render_w x render_h
+    // at frame 12 once initial GUI & asset validation complete.
     int boot_w = gles.RenderWidth();
     int boot_h = gles.RenderHeight();
     bool need_post_boot_promote = false;
-    if (boot_w > 1920 || boot_h > 1080) {
-        double s = std::min(1920.0 / boot_w, 1080.0 / boot_h);
-        boot_w = std::max(640, static_cast<int>(boot_w * s + 0.5) & ~1);
-        boot_h = std::max(360, static_cast<int>(boot_h * s + 0.5) & ~1);
-        if (boot_w <= boot_h) boot_w = boot_h + 16;
-        need_post_boot_promote = true;
+    {
+        const double aspect = static_cast<double>(std::max(1, boot_w)) / std::max(1, boot_h);
+        if (depot_profile.gui_tier == DepotGuiTier::Res2048x1536) {
+            // GuiResourceManager skips 2048x1536 when (2048 > boot_w && 1536 > boot_h).
+            if (boot_w < 2048 && boot_h < 1536) {
+                boot_w = 2048;
+                boot_h = std::max(360, static_cast<int>(std::lround(boot_w / aspect)) & ~1);
+                if (boot_w <= boot_h) boot_w = boot_h + 16;
+                need_post_boot_promote = true;
+            }
+        } else if (depot_profile.gui_tier == DepotGuiTier::Res480x320) {
+            // Skip 960x640 (960 > boot_w && 640 > boot_h) while accepting 480x320.
+            if (boot_w >= 960 || boot_h >= 640) {
+                double s = std::min(958.0 / boot_w, 638.0 / boot_h);
+                boot_w = std::max(480, static_cast<int>(boot_w * s + 0.5) & ~1);
+                boot_h = std::max(320, static_cast<int>(boot_h * s + 0.5) & ~1);
+                if (boot_w <= boot_h) boot_w = boot_h + 16;
+                need_post_boot_promote = true;
+            }
+        } else {
+            // Res960x640 / Auto: skip 2048x1536 (<=1920x1080) and accept 960x640 (>=960px wide).
+            if (boot_w > 1920 || boot_h > 1080) {
+                double s = std::min(1920.0 / boot_w, 1080.0 / boot_h);
+                boot_w = std::max(640, static_cast<int>(boot_w * s + 0.5) & ~1);
+                boot_h = std::max(360, static_cast<int>(boot_h * s + 0.5) & ~1);
+                if (boot_w <= boot_h) boot_w = boot_h + 16;
+                need_post_boot_promote = true;
+            } else if (boot_w < 960 && boot_h < 640) {
+                boot_w = 960;
+                boot_h = std::max(360, static_cast<int>(std::lround(boot_w / aspect)) & ~1);
+                if (boot_w <= boot_h) boot_w = boot_h + 16;
+                need_post_boot_promote = true;
+            }
+        }
+    }
+    if (need_post_boot_promote) {
+        std::fprintf(stdout, "[RR3] Boot GUI-tier view=%dx%d -> will promote to render=%dx%d after init\n",
+                     boot_w, boot_h, gles.RenderWidth(), gles.RenderHeight());
     }
 
     if (fn_set_tv) cpu.CallGuest(fn_set_tv, {env_ptr, act, cfg.android_tv_mode ? 1ULL : 0ULL});
@@ -845,10 +909,17 @@ int main(int argc, char** argv) {
             if (*opt_flag == 0) *opt_flag = 1;
         }
 
-        // Promote supersampled / >1080p render resolution after AssetDownloadService finishes (frame 12)
+        // Promote boot GUI-tier view to actual render_w x render_h after AssetDownloadService finishes (frame 12)
         if (need_post_boot_promote && frame == 12) {
             need_post_boot_promote = false;
             std::fprintf(stdout, "[RR3] Post-boot promote -> render=%dx%d\n", gles.RenderWidth(), gles.RenderHeight());
+            if (known_rr3_14_0_1) {
+                auto* pp_scr = *reinterpret_cast<uint64_t**>(mod_rr3->load_bias + 0x1f6df40ULL);
+                pre_resize_scr = pp_scr ? *pp_scr : 0;
+                pre_resize_hdr = pre_resize_scr ? *reinterpret_cast<uint8_t*>(pre_resize_scr + 0x78ULL) : 0;
+                pending_post_resize_sync = true;
+                pending_resize_frames = 0;
+            }
             cpu.CallGuest(fn_view_changed, {
                 env_ptr, act,
                 static_cast<uint64_t>(gles.RenderWidth()),

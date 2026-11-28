@@ -20,13 +20,328 @@ namespace {
 
 constexpr GLenum kGlTextureMaxAnisotropyExt = 0x84FE;
 constexpr GLenum kGlMaxTextureMaxAnisotropyExt = 0x84FF;
+constexpr GLenum kGlRgbS3tcDxt1Ext = 0x83F0;
+constexpr GLenum kGlRgbaS3tcDxt1Ext = 0x83F1;
+constexpr GLenum kGlRgbaS3tcDxt3Ext = 0x83F2;
+constexpr GLenum kGlRgbaS3tcDxt5Ext = 0x83F3;
+constexpr GLenum kGlRgbPvrtc4BppImg = 0x8C00;
+constexpr GLenum kGlRgbPvrtc2BppImg = 0x8C01;
+constexpr GLenum kGlRgbaPvrtc4BppImg = 0x8C02;
+constexpr GLenum kGlRgbaPvrtc2BppImg = 0x8C03;
 constexpr GLenum kGlAtcRgbAmd = 0x8C92;
 constexpr GLenum kGlAtcRgbaExplicitAmd = 0x8C93;
 constexpr GLenum kGlAtcRgbaInterpolatedAmd = 0x87EE;
 constexpr GLenum kGlEtc1Rgb8Oes = 0x8D64;
 
+inline bool IsAtcFormat(GLenum fmt) {
+    return fmt == kGlAtcRgbAmd || fmt == kGlAtcRgbaExplicitAmd || fmt == kGlAtcRgbaInterpolatedAmd;
+}
+inline bool IsDxtFormat(GLenum fmt) {
+    return fmt == kGlRgbS3tcDxt1Ext || fmt == kGlRgbaS3tcDxt1Ext ||
+           fmt == kGlRgbaS3tcDxt3Ext || fmt == kGlRgbaS3tcDxt5Ext;
+}
+inline bool IsPvrtcFormat(GLenum fmt) {
+    return fmt == kGlRgbPvrtc4BppImg || fmt == kGlRgbPvrtc2BppImg ||
+           fmt == kGlRgbaPvrtc4BppImg || fmt == kGlRgbaPvrtc2BppImg;
+}
+inline uint32_t ReadU32Le(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+}
+inline uint8_t Expand5To8(int v) { return static_cast<uint8_t>((v << 3) | (v >> 2)); }
+inline uint8_t Expand6To8(int v) { return static_cast<uint8_t>((v << 2) | (v >> 4)); }
+inline uint8_t Expand4To5(int v) { return static_cast<uint8_t>((v << 1) | (v >> 3)); }
+
 inline uint8_t ClampU8(int v) {
     return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+
+void DecodeDxtColorBlock(const uint8_t* blk, bool four_color_only, bool punch_through_alpha, uint8_t out_rgba[16][4]) {
+    const uint16_t c0 = static_cast<uint16_t>(blk[0] | (blk[1] << 8));
+    const uint16_t c1 = static_cast<uint16_t>(blk[2] | (blk[3] << 8));
+    const uint32_t idx = ReadU32Le(blk + 4);
+
+    const int r0 = Expand5To8((c0 >> 11) & 0x1F);
+    const int g0 = Expand6To8((c0 >> 5) & 0x3F);
+    const int b0 = Expand5To8(c0 & 0x1F);
+    const int r1 = Expand5To8((c1 >> 11) & 0x1F);
+    const int g1 = Expand6To8((c1 >> 5) & 0x3F);
+    const int b1 = Expand5To8(c1 & 0x1F);
+
+    uint8_t pal[4][4];
+    pal[0][0] = static_cast<uint8_t>(r0); pal[0][1] = static_cast<uint8_t>(g0); pal[0][2] = static_cast<uint8_t>(b0); pal[0][3] = 255;
+    pal[1][0] = static_cast<uint8_t>(r1); pal[1][1] = static_cast<uint8_t>(g1); pal[1][2] = static_cast<uint8_t>(b1); pal[1][3] = 255;
+    if (four_color_only || c0 > c1) {
+        pal[2][0] = static_cast<uint8_t>((2 * r0 + r1 + 1) / 3);
+        pal[2][1] = static_cast<uint8_t>((2 * g0 + g1 + 1) / 3);
+        pal[2][2] = static_cast<uint8_t>((2 * b0 + b1 + 1) / 3);
+        pal[2][3] = 255;
+        pal[3][0] = static_cast<uint8_t>((r0 + 2 * r1 + 1) / 3);
+        pal[3][1] = static_cast<uint8_t>((g0 + 2 * g1 + 1) / 3);
+        pal[3][2] = static_cast<uint8_t>((b0 + 2 * b1 + 1) / 3);
+        pal[3][3] = 255;
+    } else {
+        pal[2][0] = static_cast<uint8_t>((r0 + r1) / 2);
+        pal[2][1] = static_cast<uint8_t>((g0 + g1) / 2);
+        pal[2][2] = static_cast<uint8_t>((b0 + b1) / 2);
+        pal[2][3] = 255;
+        pal[3][0] = 0; pal[3][1] = 0; pal[3][2] = 0;
+        pal[3][3] = punch_through_alpha ? 0 : 255;
+    }
+
+    for (int i = 0; i < 16; ++i) {
+        const uint32_t sel = (idx >> (2 * i)) & 3u;
+        out_rgba[i][0] = pal[sel][0];
+        out_rgba[i][1] = pal[sel][1];
+        out_rgba[i][2] = pal[sel][2];
+        out_rgba[i][3] = pal[sel][3];
+    }
+}
+
+struct PvrtcColor {
+    uint8_t r, g, b, a;
+};
+
+uint32_t PvrtcTwiddleUV(uint32_t x_size, uint32_t y_size, uint32_t x_pos, uint32_t y_pos) {
+    uint32_t min_dim = x_size;
+    uint32_t max_val = y_pos;
+    if (y_size < x_size) {
+        min_dim = y_size;
+        max_val = x_pos;
+    }
+    uint32_t twiddled = 0;
+    uint32_t src_bit = 1;
+    uint32_t dst_bit = 1;
+    uint32_t shift_count = 0;
+    while (src_bit < min_dim) {
+        if (y_pos & src_bit) twiddled |= dst_bit;
+        if (x_pos & src_bit) twiddled |= (dst_bit << 1);
+        src_bit <<= 1;
+        dst_bit <<= 2;
+        ++shift_count;
+    }
+    max_val >>= shift_count;
+    twiddled |= (max_val << (2u * shift_count));
+    return twiddled;
+}
+
+PvrtcColor PvrtcUnpackColorA(uint32_t cd) {
+    if (cd & 0x8000u) {
+        int r5 = static_cast<int>((cd >> 10) & 0x1Fu);
+        int g5 = static_cast<int>((cd >> 5) & 0x1Fu);
+        int b4 = static_cast<int>((cd >> 1) & 0x0Fu);
+        int b5 = Expand4To5(b4);
+        return {Expand5To8(r5), Expand5To8(g5), Expand5To8(b5), 255};
+    }
+    int a3 = static_cast<int>((cd >> 12) & 0x07u);
+    int r4 = static_cast<int>((cd >> 8) & 0x0Fu);
+    int g4 = static_cast<int>((cd >> 4) & 0x0Fu);
+    int b3 = static_cast<int>((cd >> 1) & 0x07u);
+    int a4 = a3 << 1;
+    int b5 = (b3 << 2) | (b3 >> 1);
+    return {
+        Expand5To8(Expand4To5(r4)),
+        Expand5To8(Expand4To5(g4)),
+        Expand5To8(b5),
+        static_cast<uint8_t>((a4 << 4) | a4)
+    };
+}
+
+PvrtcColor PvrtcUnpackColorB(uint32_t cd) {
+    if (cd & 0x80000000u) {
+        int r5 = static_cast<int>((cd >> 26) & 0x1Fu);
+        int g5 = static_cast<int>((cd >> 21) & 0x1Fu);
+        int b5 = static_cast<int>((cd >> 16) & 0x1Fu);
+        return {Expand5To8(r5), Expand5To8(g5), Expand5To8(b5), 255};
+    }
+    int a3 = static_cast<int>((cd >> 28) & 0x07u);
+    int r4 = static_cast<int>((cd >> 24) & 0x0Fu);
+    int g4 = static_cast<int>((cd >> 20) & 0x0Fu);
+    int b4 = static_cast<int>((cd >> 16) & 0x0Fu);
+    int a4 = a3 << 1;
+    return {
+        Expand5To8(Expand4To5(r4)),
+        Expand5To8(Expand4To5(g4)),
+        Expand5To8(Expand4To5(b4)),
+        static_cast<uint8_t>((a4 << 4) | a4)
+    };
+}
+
+bool DecodePvrtc1ToRgba(GLenum fmt, int w, int h, const uint8_t* src, int image_size, std::vector<uint8_t>& out_rgba) {
+    if (!src || w <= 0 || h <= 0) return false;
+    const bool is_2bpp = (fmt == kGlRgbPvrtc2BppImg || fmt == kGlRgbaPvrtc2BppImg);
+    const bool force_opaque = (fmt == kGlRgbPvrtc4BppImg || fmt == kGlRgbPvrtc2BppImg);
+    const int blk_w = is_2bpp ? 8 : 4;
+    const int blk_h = 4;
+    const int min_w = is_2bpp ? 16 : 8;
+    const int min_h = 8;
+
+    const int eff_w = std::max(w, min_w);
+    const int eff_h = std::max(h, min_h);
+    const int num_x = std::max(2, (eff_w + blk_w - 1) / blk_w);
+    const int num_y = std::max(2, (eff_h + blk_h - 1) / blk_h);
+    const size_t total_blocks = static_cast<size_t>(num_x) * static_cast<size_t>(num_y);
+    if (image_size < static_cast<int>(total_blocks * 8)) return false;
+
+    const int grid_w = num_x * blk_w;
+    const int grid_h = num_y * blk_h;
+
+    std::vector<PvrtcColor> col_a(total_blocks);
+    std::vector<PvrtcColor> col_b(total_blocks);
+    std::vector<uint8_t> mod_w(static_cast<size_t>(grid_w) * grid_h, 0);
+    std::vector<uint8_t> mod_flag(static_cast<size_t>(grid_w) * grid_h, 0);
+    // mod_flag: 0=direct, 1=punch-through(alpha=0), 2=avg4(2bpp checker), 3=avgH(2bpp), 4=avgV(2bpp)
+
+    static constexpr uint8_t kStd4[4] = {0, 3, 5, 8};
+    static constexpr uint8_t kPunch4[4] = {0, 4, 4, 8};
+
+    for (int by = 0; by < num_y; ++by) {
+        for (int bx = 0; bx < num_x; ++bx) {
+            const uint32_t tw = PvrtcTwiddleUV(static_cast<uint32_t>(num_x), static_cast<uint32_t>(num_y),
+                                               static_cast<uint32_t>(bx), static_cast<uint32_t>(by));
+            if (tw >= total_blocks) return false;
+            const uint8_t* pkt = src + static_cast<size_t>(tw) * 8;
+            const uint32_t mod_bits = ReadU32Le(pkt);
+            const uint32_t col_bits = ReadU32Le(pkt + 4);
+            const size_t bidx = static_cast<size_t>(by) * num_x + bx;
+            col_a[bidx] = PvrtcUnpackColorA(col_bits);
+            col_b[bidx] = PvrtcUnpackColorB(col_bits);
+            const uint32_t mode = col_bits & 1u;
+
+            if (!is_2bpp) {
+                uint32_t mb = mod_bits;
+                for (int py = 0; py < 4; ++py) {
+                    const size_t row_off = static_cast<size_t>(by * 4 + py) * grid_w + bx * 4;
+                    for (int px = 0; px < 4; ++px) {
+                        const uint32_t code = mb & 3u;
+                        mb >>= 2;
+                        if (mode == 0) {
+                            mod_w[row_off + px] = kStd4[code];
+                        } else {
+                            mod_w[row_off + px] = kPunch4[code];
+                            if (code == 2) mod_flag[row_off + px] = 1;
+                        }
+                    }
+                }
+            } else if (mode == 0) {
+                uint32_t mb = mod_bits;
+                for (int py = 0; py < 4; ++py) {
+                    const size_t row_off = static_cast<size_t>(by * 4 + py) * grid_w + bx * 8;
+                    for (int px = 0; px < 8; ++px) {
+                        mod_w[row_off + px] = (mb & 1u) ? 8 : 0;
+                        mb >>= 1;
+                    }
+                }
+            } else {
+                const bool hv_mode = (mod_bits & 1u) != 0;
+                const bool vert_mode = (mod_bits & (1u << 20)) != 0;
+                const uint8_t odd_flag = hv_mode ? (vert_mode ? 4 : 3) : 2;
+                uint32_t mb = mod_bits;
+                for (int py = 0; py < 4; ++py) {
+                    const size_t row_off = static_cast<size_t>(by * 4 + py) * grid_w + bx * 8;
+                    for (int px = 0; px < 8; ++px) {
+                        if (((px ^ py) & 1) == 0) {
+                            const uint32_t code = mb & 3u;
+                            mb >>= 2;
+                            if (px == 0 && py == 0) {
+                                mod_w[row_off + px] = (code & 2u) ? 8 : 0;
+                            } else if (hv_mode && px == 4 && py == 2) {
+                                mod_w[row_off + px] = (code & 2u) ? 8 : 0;
+                            } else {
+                                mod_w[row_off + px] = kStd4[code];
+                            }
+                        } else {
+                            mod_flag[row_off + px] = odd_flag;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    auto floor_div = [](int a, int b) -> int {
+        int q = a / b;
+        int r = a % b;
+        if (r < 0) --q;
+        return q;
+    };
+    auto wrap = [](int v, int m) -> int {
+        int r = v % m;
+        return r < 0 ? r + m : r;
+    };
+
+    const int half_w = blk_w / 2;
+    const int half_h = blk_h / 2;
+    const int area_shift = is_2bpp ? 5 : 4;
+
+    out_rgba.resize(static_cast<size_t>(w) * h * 4);
+    for (int y = 0; y < h; ++y) {
+        const int y_adj = y - half_h;
+        const int by0 = wrap(floor_div(y_adj, blk_h), num_y);
+        const int by1 = (by0 + 1) % num_y;
+        const int wy = y_adj - floor_div(y_adj, blk_h) * blk_h;
+        const int inv_wy = blk_h - wy;
+
+        for (int x = 0; x < w; ++x) {
+            const int x_adj = x - half_w;
+            const int bx0 = wrap(floor_div(x_adj, blk_w), num_x);
+            const int bx1 = (bx0 + 1) % num_x;
+            const int wx = x_adj - floor_div(x_adj, blk_w) * blk_w;
+            const int inv_wx = blk_w - wx;
+
+            const int w00 = inv_wx * inv_wy;
+            const int w10 = wx * inv_wy;
+            const int w01 = inv_wx * wy;
+            const int w11 = wx * wy;
+
+            const size_t i00 = static_cast<size_t>(by0) * num_x + bx0;
+            const size_t i10 = static_cast<size_t>(by0) * num_x + bx1;
+            const size_t i01 = static_cast<size_t>(by1) * num_x + bx0;
+            const size_t i11 = static_cast<size_t>(by1) * num_x + bx1;
+
+            auto interp = [&](const std::vector<PvrtcColor>& tbl, int& r, int& g, int& b, int& a) {
+                r = (tbl[i00].r * w00 + tbl[i10].r * w10 + tbl[i01].r * w01 + tbl[i11].r * w11) >> area_shift;
+                g = (tbl[i00].g * w00 + tbl[i10].g * w10 + tbl[i01].g * w01 + tbl[i11].g * w11) >> area_shift;
+                b = (tbl[i00].b * w00 + tbl[i10].b * w10 + tbl[i01].b * w01 + tbl[i11].b * w11) >> area_shift;
+                a = (tbl[i00].a * w00 + tbl[i10].a * w10 + tbl[i01].a * w01 + tbl[i11].a * w11) >> area_shift;
+            };
+
+            int ar, ag, ab, aa, br, bg, bb, ba;
+            interp(col_a, ar, ag, ab, aa);
+            interp(col_b, br, bg, bb, ba);
+
+            const size_t pidx = static_cast<size_t>(y) * grid_w + x;
+            const uint8_t fl = mod_flag[pidx];
+            int mw = mod_w[pidx];
+            if (fl >= 2) {
+                const int xl = wrap(x - 1, grid_w);
+                const int xr = wrap(x + 1, grid_w);
+                const int yu = wrap(y - 1, grid_h);
+                const int yd = wrap(y + 1, grid_h);
+                const int wl = mod_w[static_cast<size_t>(y) * grid_w + xl];
+                const int wr = mod_w[static_cast<size_t>(y) * grid_w + xr];
+                const int wu = mod_w[static_cast<size_t>(yu) * grid_w + x];
+                const int wd = mod_w[static_cast<size_t>(yd) * grid_w + x];
+                if (fl == 2)      mw = (wl + wr + wu + wd + 2) / 4;
+                else if (fl == 3) mw = (wl + wr + 1) / 2;
+                else              mw = (wu + wd + 1) / 2;
+            }
+
+            const int inv_m = 8 - mw;
+            uint8_t* dst = out_rgba.data() + (static_cast<size_t>(y) * w + x) * 4;
+            dst[0] = static_cast<uint8_t>((ar * inv_m + br * mw) / 8);
+            dst[1] = static_cast<uint8_t>((ag * inv_m + bg * mw) / 8);
+            dst[2] = static_cast<uint8_t>((ab * inv_m + bb * mw) / 8);
+            if (force_opaque) {
+                dst[3] = 255;
+            } else if (fl == 1) {
+                dst[3] = 0;
+            } else {
+                dst[3] = static_cast<uint8_t>((aa * inv_m + ba * mw) / 8);
+            }
+        }
+    }
+    return true;
 }
 
 void DecodeAtcColorBlock(const uint8_t* blk, uint8_t out_rgb[16][3]) {
@@ -99,9 +414,17 @@ void DecodeAtcInterpolatedAlpha(const uint8_t* blk, uint8_t out_a[16]) {
 
 bool DecodeCompressedToRgba(GLenum fmt, int w, int h, const uint8_t* src, int image_size, std::vector<uint8_t>& out_rgba) {
     if (!src || w <= 0 || h <= 0) return false;
-    int bw = (w + 3) / 4;
-    int bh = (h + 3) / 4;
-    size_t blk_bytes = (fmt == kGlAtcRgbAmd || fmt == kGlEtc1Rgb8Oes) ? 8 : 16;
+    if (IsPvrtcFormat(fmt)) {
+        return DecodePvrtc1ToRgba(fmt, w, h, src, image_size, out_rgba);
+    }
+    if (!IsAtcFormat(fmt) && !IsDxtFormat(fmt) && fmt != kGlEtc1Rgb8Oes) {
+        return false;
+    }
+
+    const int bw = (w + 3) / 4;
+    const int bh = (h + 3) / 4;
+    const size_t blk_bytes = (fmt == kGlAtcRgbAmd || fmt == kGlEtc1Rgb8Oes ||
+                              fmt == kGlRgbS3tcDxt1Ext || fmt == kGlRgbaS3tcDxt1Ext) ? 8 : 16;
     if (image_size < static_cast<int>(static_cast<size_t>(bw) * bh * blk_bytes)) return false;
 
     out_rgba.resize(static_cast<size_t>(w) * h * 4);
@@ -123,6 +446,34 @@ bool DecodeCompressedToRgba(GLenum fmt, int w, int h, const uint8_t* src, int im
                         dst[1] = static_cast<uint8_t>((c >> 8) & 0xFF);
                         dst[2] = static_cast<uint8_t>((c >> 16) & 0xFF);
                         dst[3] = 255;
+                    }
+                }
+            } else if (IsDxtFormat(fmt)) {
+                uint8_t rgba[16][4];
+                if (fmt == kGlRgbS3tcDxt1Ext || fmt == kGlRgbaS3tcDxt1Ext) {
+                    DecodeDxtColorBlock(blk, false, fmt == kGlRgbaS3tcDxt1Ext, rgba);
+                } else {
+                    uint8_t alpha[16];
+                    if (fmt == kGlRgbaS3tcDxt3Ext) {
+                        DecodeAtcExplicitAlpha(blk, alpha);
+                    } else {
+                        DecodeAtcInterpolatedAlpha(blk, alpha);
+                    }
+                    DecodeDxtColorBlock(blk + 8, true, false, rgba);
+                    for (int i = 0; i < 16; ++i) rgba[i][3] = alpha[i];
+                }
+                for (int py = 0; py < 4; ++py) {
+                    int y = by * 4 + py;
+                    if (y >= h) continue;
+                    for (int px = 0; px < 4; ++px) {
+                        int x = bx * 4 + px;
+                        if (x >= w) continue;
+                        int pi = py * 4 + px;
+                        uint8_t* dst = out_rgba.data() + (static_cast<size_t>(y) * w + x) * 4;
+                        dst[0] = rgba[pi][0];
+                        dst[1] = rgba[pi][1];
+                        dst[2] = rgba[pi][2];
+                        dst[3] = rgba[pi][3];
                     }
                 }
             } else {
@@ -171,6 +522,12 @@ const T* CPtr(uint64_t v) {
 } // namespace
 
 GlesBridge::GlesBridge(CpuRuntime& cpu) : cpu_(cpu) {}
+
+bool GlesBridge::DecodeCompressedTextureToRgba(uint32_t gl_format, int width, int height,
+                                               const uint8_t* src, int image_size,
+                                               std::vector<uint8_t>& out_rgba) {
+    return DecodeCompressedToRgba(static_cast<GLenum>(gl_format), width, height, src, image_size, out_rgba);
+}
 
 GlesBridge::~GlesBridge() {
     Shutdown();
@@ -293,23 +650,63 @@ bool GlesBridge::Init(HWND hwnd, int width, int height, const PcConfig& cfg, int
     gl_version_ = safe_str(glGetString(GL_VERSION));
     gl_extensions_ = safe_str(glGetString(GL_EXTENSIONS));
 
-    // Curate guest GL_EXTENSIONS: expose ATC + ETC1 (decoded transparently to RGBA8 in GlesBridge)
-    // and hide DXT/S3TC so RR3 selects the local .atc.dds.z textures present in .depot!
+    // Curate guest GL_EXTENSIONS so RR3's IsTextureFormatForThisGpu (priority: PVRTC > ATC > DXT > ETC1)
+    // selects the exact compressed texture pack present in the user's .depot!
+    host_supports_s3tc_ =
+        (gl_extensions_.find("GL_EXT_texture_compression_s3tc") != std::string::npos) ||
+        (gl_extensions_.find("GL_EXT_texture_compression_dxt1") != std::string::npos &&
+         gl_extensions_.find("GL_ANGLE_texture_compression_dxt3") != std::string::npos &&
+         gl_extensions_.find("GL_ANGLE_texture_compression_dxt5") != std::string::npos);
+    cpu_decoded_dxt_tex_.clear();
     {
+        const bool keep_dxt = (target_gpu_format_ == DepotGpuFormat::Dxt);
         std::istringstream iss(gl_extensions_);
         std::string tok;
         std::string curated;
         while (iss >> tok) {
-            if (tok.find("texture_compression_dxt") != std::string::npos ||
-                tok.find("texture_compression_s3tc") != std::string::npos ||
-                tok.find("texture_compression_bptc") != std::string::npos ||
-                tok.find("texture_compression_rgtc") != std::string::npos) {
+            if (tok.find("texture_compression_bptc") != std::string::npos ||
+                tok.find("texture_compression_rgtc") != std::string::npos ||
+                tok.find("texture_compression_astc") != std::string::npos ||
+                tok.find("texture_compression_pvrtc") != std::string::npos ||
+                tok.find("compressed_ATC") != std::string::npos ||
+                tok.find("compressed_ETC") != std::string::npos) {
+                continue;
+            }
+            if (!keep_dxt &&
+                (tok.find("texture_compression_dxt") != std::string::npos ||
+                 tok.find("texture_compression_s3tc") != std::string::npos)) {
                 continue;
             }
             if (!curated.empty()) curated.push_back(' ');
             curated += tok;
         }
-        curated += " GL_AMD_compressed_ATC_texture GL_OES_compressed_ETC1_RGB8_texture";
+        switch (target_gpu_format_) {
+            case DepotGpuFormat::Pvrtc:
+                curated += " GL_IMG_texture_compression_pvrtc GL_OES_compressed_ETC1_RGB8_texture";
+                break;
+            case DepotGpuFormat::Atc:
+                curated += " GL_AMD_compressed_ATC_texture GL_OES_compressed_ETC1_RGB8_texture";
+                break;
+            case DepotGpuFormat::Dxt:
+                if (curated.find("GL_EXT_texture_compression_s3tc") == std::string::npos) {
+                    curated += " GL_EXT_texture_compression_s3tc";
+                }
+                if (curated.find("GL_EXT_texture_compression_dxt1") == std::string::npos) {
+                    curated += " GL_EXT_texture_compression_dxt1";
+                }
+                if (curated.find("GL_ANGLE_texture_compression_dxt3") == std::string::npos) {
+                    curated += " GL_ANGLE_texture_compression_dxt3";
+                }
+                if (curated.find("GL_ANGLE_texture_compression_dxt5") == std::string::npos) {
+                    curated += " GL_ANGLE_texture_compression_dxt5";
+                }
+                curated += " GL_OES_compressed_ETC1_RGB8_texture";
+                break;
+            case DepotGpuFormat::Etc:
+                // Expose ONLY ETC1 (no PVRTC, ATC, or S3TC/DXT) so RR3 selects Mali .etc.dds.z assets.
+                curated += " GL_OES_compressed_ETC1_RGB8_texture";
+                break;
+        }
         guest_extensions_ = std::move(curated);
     }
 
@@ -983,7 +1380,7 @@ void GlesBridge::RegisterSymbols(ElfLoader& loader) {
                     static_cast<GLboolean>(c.GetW(2)), static_cast<GLboolean>(c.GetW(3)));
     });
     fn("glCompileShader", [](CpuContext& c) { glCompileShader(c.GetW(0)); });
-    fn("glCompressedTexImage2D", [](CpuContext& c) {
+    fn("glCompressedTexImage2D", [this](CpuContext& c) {
         GLenum target = c.GetW(0);
         GLint level = static_cast<GLint>(c.GetW(1));
         GLenum fmt = c.GetW(2);
@@ -992,8 +1389,21 @@ void GlesBridge::RegisterSymbols(ElfLoader& loader) {
         GLint border = static_cast<GLint>(c.GetW(5));
         GLsizei img_sz = static_cast<GLsizei>(c.GetW(6));
         const void* data = CPtr<void>(c.GetX(7));
-        if (fmt == kGlAtcRgbAmd || fmt == kGlAtcRgbaExplicitAmd ||
-            fmt == kGlAtcRgbaInterpolatedAmd || fmt == kGlEtc1Rgb8Oes) {
+
+        bool decode_cpu = IsAtcFormat(fmt) || fmt == kGlEtc1Rgb8Oes || IsPvrtcFormat(fmt);
+        if (IsDxtFormat(fmt)) {
+            GLint bound = 0;
+            glGetIntegerv(target == GL_TEXTURE_2D ? GL_TEXTURE_BINDING_2D : GL_TEXTURE_BINDING_CUBE_MAP, &bound);
+            const uint32_t tex_id = static_cast<uint32_t>(bound);
+            if (!host_supports_s3tc_ || (level == 0 && ((w & 3) != 0 || (h & 3) != 0)) ||
+                (level > 0 && cpu_decoded_dxt_tex_.count(tex_id) > 0)) {
+                decode_cpu = true;
+                if (tex_id != 0) cpu_decoded_dxt_tex_.insert(tex_id);
+            } else if (level == 0 && tex_id != 0) {
+                cpu_decoded_dxt_tex_.erase(tex_id);
+            }
+        }
+        if (decode_cpu) {
             std::vector<uint8_t> rgba;
             if (DecodeCompressedToRgba(fmt, w, h, static_cast<const uint8_t*>(data), img_sz, rgba)) {
                 GLint prev_align = 4;
@@ -1006,7 +1416,7 @@ void GlesBridge::RegisterSymbols(ElfLoader& loader) {
         }
         glCompressedTexImage2D(target, level, fmt, w, h, border, img_sz, data);
     });
-    fn("glCompressedTexSubImage2D", [](CpuContext& c) {
+    fn("glCompressedTexSubImage2D", [this](CpuContext& c) {
         GLenum target = c.GetW(0);
         GLint level = static_cast<GLint>(c.GetW(1));
         GLint xoff = static_cast<GLint>(c.GetW(2));
@@ -1016,8 +1426,16 @@ void GlesBridge::RegisterSymbols(ElfLoader& loader) {
         GLenum fmt = c.GetW(6);
         GLsizei img_sz = static_cast<GLsizei>(c.GetW(7));
         const void* data = CPtr<void>(c.ReadStackU64(0));
-        if (fmt == kGlAtcRgbAmd || fmt == kGlAtcRgbaExplicitAmd ||
-            fmt == kGlAtcRgbaInterpolatedAmd || fmt == kGlEtc1Rgb8Oes) {
+
+        bool decode_cpu = IsAtcFormat(fmt) || fmt == kGlEtc1Rgb8Oes || IsPvrtcFormat(fmt);
+        if (IsDxtFormat(fmt)) {
+            GLint bound = 0;
+            glGetIntegerv(target == GL_TEXTURE_2D ? GL_TEXTURE_BINDING_2D : GL_TEXTURE_BINDING_CUBE_MAP, &bound);
+            if (!host_supports_s3tc_ || cpu_decoded_dxt_tex_.count(static_cast<uint32_t>(bound)) > 0) {
+                decode_cpu = true;
+            }
+        }
+        if (decode_cpu) {
             std::vector<uint8_t> rgba;
             if (DecodeCompressedToRgba(fmt, w, h, static_cast<const uint8_t*>(data), img_sz, rgba)) {
                 GLint prev_align = 4;
@@ -1050,7 +1468,14 @@ void GlesBridge::RegisterSymbols(ElfLoader& loader) {
     fn("glDeleteProgram", [](CpuContext& c) { glDeleteProgram(c.GetW(0)); });
     fn("glDeleteRenderbuffers", [](CpuContext& c) { glDeleteRenderbuffers(static_cast<GLsizei>(c.GetW(0)), CPtr<GLuint>(c.GetX(1))); });
     fn("glDeleteShader", [](CpuContext& c) { glDeleteShader(c.GetW(0)); });
-    fn("glDeleteTextures", [](CpuContext& c) { glDeleteTextures(static_cast<GLsizei>(c.GetW(0)), CPtr<GLuint>(c.GetX(1))); });
+    fn("glDeleteTextures", [this](CpuContext& c) {
+        GLsizei n = static_cast<GLsizei>(c.GetW(0));
+        const GLuint* ids = CPtr<GLuint>(c.GetX(1));
+        if (ids && n > 0 && !cpu_decoded_dxt_tex_.empty()) {
+            for (GLsizei i = 0; i < n; ++i) cpu_decoded_dxt_tex_.erase(ids[i]);
+        }
+        glDeleteTextures(n, ids);
+    });
     fn("glDepthFunc", [](CpuContext& c) { glDepthFunc(c.GetW(0)); });
     fn("glDepthMask", [](CpuContext& c) { glDepthMask(static_cast<GLboolean>(c.GetW(0))); });
     fn("glDepthRangef", [](CpuContext& c) { glDepthRangef(c.GetS(0), c.GetS(1)); });
