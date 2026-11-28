@@ -11,6 +11,8 @@ A native Windows x64 port of Real Racing 3 (Android). It runs offline through Di
 > [!WARNING]
 > This repo and its releases do not include any EA or Firemonkeys game files. You need to provide your own Real Racing 3 APK and `com.ea.games.r3_row` data folder.
 
+## Support this project by giving the repo a star!
+
 ## What's in it
 
 Opening `rr3_pc.exe` brings up the launcher. Hit **Play** and the game starts right in the same process (or run `rr3_pc.exe --play` to skip the launcher).
