@@ -13,6 +13,8 @@ A native Windows x64 port of Real Racing 3 (Android). It runs offline through Di
 
 ## Support this project by giving the repo a star!
 
+Support the project by giving the repo a star to get recognition, also share this project to everyone who's interested in Real Racing 3!
+
 ## What's in it
 
 Opening `rr3_pc.exe` brings up the launcher. Hit **Play** and the game starts right in the same process (or run `rr3_pc.exe --play` to skip the launcher).
