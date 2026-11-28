@@ -193,6 +193,8 @@ int main(int argc, char** argv) {
     bool cli_profile_slow = false;
     bool cli_has_verbose = false;
     bool cli_verbose = false;
+    bool cli_has_online = false;
+    bool cli_online = false;
     bool cli_has_quality = false;
     QualityPreset cli_quality = QualityPreset::Ultra;
     bool cli_config_ui = false;
@@ -263,6 +265,12 @@ int main(int argc, char** argv) {
         } else if (arg == "--quiet") {
             cli_has_verbose = true;
             cli_verbose = false;
+        } else if (arg == "--online") {
+            cli_has_online = true;
+            cli_online = true;
+        } else if (arg == "--offline") {
+            cli_has_online = true;
+            cli_online = false;
         } else if (arg == "--quality" && i + 1 < argc) {
             cli_has_quality = true;
             cli_quality = ParseQualityPreset(argv[++i], QualityPreset::Ultra);
@@ -364,6 +372,7 @@ int main(int argc, char** argv) {
 
     if (cli_no_vsync) cfg.vsync = false;
     if (cli_has_verbose) cfg.verbose_logs = cli_verbose;
+    if (cli_has_online) cfg.online_mode = cli_online;
     if (cli_has_quality) cfg.quality_preset = cli_quality;
     if (cli_render_scale > 0.0f) cfg.render_scale = std::clamp(cli_render_scale, 0.5f, 2.0f);
     if (cli_has_mode) cfg.window_mode = cli_mode;
@@ -579,6 +588,7 @@ int main(int argc, char** argv) {
     CpuRuntime cpu;
     ElfLoader loader(cpu);
     BionicRuntime bionic(cpu, loader, vfs);
+    bionic.SetOnlineMode(cfg.online_mode);
     bionic.RegisterAll();
     bionic.RegisterSdkStubs();
 
@@ -620,8 +630,11 @@ int main(int argc, char** argv) {
     }
     g_rr3_bias = mod_rr3->load_bias;
 
-    const bool known_rr3_14_0_1 =
-        (mod_rr3->sha256_hex == "57edb6314fb1f73916446dccf2aab2223a932ae63ccdf2149cffeddb5aa73051");
+    const bool exact_stock_14_0_1 =
+        (mod_rr3->sha256_hex == kExpectedRr3SoSha256);
+    const bool patched_14_0_1 =
+        !exact_stock_14_0_1 && IsCompatibleRr3_14_0_1So(bin_dir / "libRealRacing3.so");
+    const bool known_rr3_14_0_1 = exact_stock_14_0_1 || patched_14_0_1;
     if (cfg.unlock_menu_fps && known_rr3_14_0_1) {
         bionic.SetSkipMenuUsleep(true);
         bionic.SetMenuUsleepRange(mod_rr3->load_bias + 0x012af0d0ULL, mod_rr3->load_bias + 0x012af130ULL);
@@ -664,10 +677,13 @@ int main(int argc, char** argv) {
 
     std::vector<std::string> unresolved;
     loader.ApplyRelocations(&unresolved);
-    std::fprintf(stdout, "[RR3] Loaded libRealRacing3.so (bias=0x%llx, sha256=%.16s..., unresolved=%zu, quality=%s, verbose=%s)\n",
+    std::fprintf(stdout, "[RR3] Loaded libRealRacing3.so (bias=0x%llx, sha256=%.16s..., build=%s, unresolved=%zu, quality=%s, online=%s, verbose=%s)\n",
                  static_cast<unsigned long long>(mod_rr3->load_bias),
-                 mod_rr3->sha256_hex.c_str(), unresolved.size(),
+                 mod_rr3->sha256_hex.c_str(),
+                 exact_stock_14_0_1 ? "stock-14.0.1" : (patched_14_0_1 ? "patched-14.0.1" : "unknown"),
+                 unresolved.size(),
                  QualityPresetToDisplayName(cfg.quality_preset),
+                 cfg.online_mode ? "ON" : "OFF",
                  cfg.verbose_logs ? "ON" : "OFF");
 
     loader.RunInitArrays();
@@ -852,6 +868,13 @@ int main(int argc, char** argv) {
                 float sx = 0.0f, sy = 0.0f;
                 map_mouse_to_render(e.button.x, e.button.y, sx, sy);
                 cpu.CallGuestWithF32(fn_touch_end, {env_ptr, act, 0ULL, 1ULL}, {sx, sy});
+            } else if (e.type == SDL_TEXTINPUT && firemint.IsTextInputActive()) {
+                firemint.OnTextInput(e.text.text);
+            } else if (e.type == SDL_KEYDOWN && firemint.IsTextInputActive() &&
+                       e.key.keysym.sym != SDLK_F10 && e.key.keysym.sym != SDLK_F11) {
+                firemint.OnTextKeyDown(e.key.keysym.sym, e.key.keysym.mod);
+            } else if (e.type == SDL_KEYUP && firemint.IsTextInputActive()) {
+                // Swallow key releases while typing in an in-game text box
             } else if (e.type == SDL_KEYDOWN && !e.key.repeat &&
                        (e.key.keysym.sym == SDLK_F11 ||
                         (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))) {
@@ -932,11 +955,10 @@ int main(int argc, char** argv) {
             }
         }
 
-        // RR3 v14.0.1 (SHA-256 verified): EA servers enabled "enable_optimized_logic" (0x1f894f8)
-        // to cache expired LTS event lookups; offline mode leaves it 0, causing 6.8M/frame string scans.
-        static const bool kKnownRr3_14_0_1 =
-            (mod_rr3->sha256_hex == "57edb6314fb1f73916446dccf2aab2223a932ae63ccdf2149cffeddb5aa73051");
-        if (kKnownRr3_14_0_1) {
+        // RR3 v14.0.1 (stock & compatible patched builds like Project Resurrection):
+        // EA servers enabled "enable_optimized_logic" (0x1f894f8) to cache expired LTS event
+        // lookups; leaving it 0 causes 6.8M/frame string scans (~16 FPS).
+        if (known_rr3_14_0_1) {
             auto* opt_flag = reinterpret_cast<uint8_t*>(mod_rr3->load_bias + 0x1f894f8ULL);
             if (*opt_flag == 0) *opt_flag = 1;
         }

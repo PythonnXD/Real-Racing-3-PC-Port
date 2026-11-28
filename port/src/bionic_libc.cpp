@@ -2,6 +2,8 @@
 #include "config.h"
 
 #include <dynarmic/interface/A64/a64.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <bcrypt.h>
 #include <direct.h>
@@ -32,6 +34,157 @@ namespace {
 
 // ---- Thread-local Bionic errno ----
 thread_local int tls_bionic_errno = 0;
+
+// ---- Virtual POSIX Socket Table (FDs 512..1023 -> Winsock2 SOCKET, active only in online mode) ----
+// Keeps virtual socket FDs disjoint from Windows CRT file descriptors (0..511)
+// while still fitting inside Linux's 1024-bit fd_set for select()/FD_SET().
+constexpr int kVirtualSocketFdBase = 512;
+constexpr int kVirtualSocketFdLimit = 1024;
+std::mutex g_sock_mtx;
+std::unordered_map<int, SOCKET> g_virt_sockets;
+std::unordered_map<int, bool> g_virt_nonblock;
+int g_next_sock_fd = kVirtualSocketFdBase;
+
+int AllocVirtSocketFd(SOCKET s, bool nonblock) {
+    std::lock_guard<std::mutex> lk(g_sock_mtx);
+    for (int tries = 0; tries < (kVirtualSocketFdLimit - kVirtualSocketFdBase); ++tries) {
+        int fd = g_next_sock_fd++;
+        if (g_next_sock_fd >= kVirtualSocketFdLimit) g_next_sock_fd = kVirtualSocketFdBase;
+        if (!g_virt_sockets.count(fd)) {
+            g_virt_sockets[fd] = s;
+            g_virt_nonblock[fd] = nonblock;
+            return fd;
+        }
+    }
+    return -1;
+}
+
+bool LookupVirtSocket(int fd, SOCKET& out_s) {
+    if (fd < kVirtualSocketFdBase) return false;
+    std::lock_guard<std::mutex> lk(g_sock_mtx);
+    auto it = g_virt_sockets.find(fd);
+    if (it == g_virt_sockets.end()) return false;
+    out_s = it->second;
+    return true;
+}
+
+bool CloseVirtSocket(int fd) {
+    if (fd < kVirtualSocketFdBase) return false;
+    SOCKET s = INVALID_SOCKET;
+    {
+        std::lock_guard<std::mutex> lk(g_sock_mtx);
+        auto it = g_virt_sockets.find(fd);
+        if (it == g_virt_sockets.end()) return false;
+        s = it->second;
+        g_virt_sockets.erase(it);
+        g_virt_nonblock.erase(fd);
+    }
+    closesocket(s);
+    return true;
+}
+
+int WsaToLinuxErrno(int wsa) {
+    switch (wsa) {
+        case 0: return 0;
+        case WSAEINTR: return 4;
+        case WSAEBADF: return 9;
+        case WSAEACCES: return 13;
+        case WSAEFAULT: return 14;
+        case WSAEINVAL: return 22;
+        case WSAEMFILE: return 24;
+        case WSAEWOULDBLOCK: return 11;   // EAGAIN
+        case WSAEINPROGRESS: return 115;  // EINPROGRESS
+        case WSAEALREADY: return 114;
+        case WSAENOTSOCK: return 88;
+        case WSAEMSGSIZE: return 90;
+        case WSAEPROTONOSUPPORT: return 93;
+        case WSAEOPNOTSUPP: return 95;
+        case WSAEAFNOSUPPORT: return 97;
+        case WSAEADDRINUSE: return 98;
+        case WSAEADDRNOTAVAIL: return 99;
+        case WSAENETDOWN: return 100;
+        case WSAENETUNREACH: return 101;
+        case WSAECONNABORTED: return 103;
+        case WSAECONNRESET: return 104;
+        case WSAENOBUFS: return 105;
+        case WSAEISCONN: return 106;
+        case WSAENOTCONN: return 107;
+        case WSAESHUTDOWN: return 32;     // EPIPE
+        case WSAETIMEDOUT: return 110;
+        case WSAECONNREFUSED: return 111;
+        case WSAEHOSTUNREACH: return 113;
+        default: return 5; // EIO
+    }
+}
+
+void SyncWsaErrno() {
+    tls_bionic_errno = WsaToLinuxErrno(WSAGetLastError());
+}
+
+int LinuxAfToWin(int af) {
+    if (af == 10) return AF_INET6; // Linux AF_INET6=10 -> Win 23
+    return af;
+}
+
+int WinAfToLinux(int af) {
+    if (af == AF_INET6) return 10;
+    return af;
+}
+
+// Android Bionic AArch64 struct addrinfo (48 bytes, BSD order):
+// ai_canonname is at +24, ai_addr is at +32, ai_next is at +40!
+struct LinuxAddrinfo {
+    int32_t  ai_flags;
+    int32_t  ai_family;
+    int32_t  ai_socktype;
+    int32_t  ai_protocol;
+    uint32_t ai_addrlen;
+    uint32_t __pad;
+    uint64_t ai_canonname;
+    uint64_t ai_addr;
+    uint64_t ai_next;
+};
+static_assert(sizeof(LinuxAddrinfo) == 48, "Bionic AArch64 addrinfo must be 48 bytes");
+static_assert(offsetof(LinuxAddrinfo, ai_canonname) == 24, "Bionic ai_canonname must be at +24");
+static_assert(offsetof(LinuxAddrinfo, ai_addr) == 32, "Bionic ai_addr must be at +32");
+static_assert(offsetof(LinuxAddrinfo, ai_next) == 40, "Bionic ai_next must be at +40");
+
+struct LinuxPollFd {
+    int32_t fd;
+    int16_t events;
+    int16_t revents;
+};
+
+struct LinuxTimeval {
+    int64_t tv_sec;
+    int64_t tv_usec;
+};
+
+struct LinuxHostent {
+    uint64_t h_name;
+    uint64_t h_aliases;
+    int32_t  h_addrtype;
+    int32_t  h_length;
+    uint64_t h_addr_list;
+};
+
+bool CopyLinuxSockaddrToWin(const void* guest_sa, int len, sockaddr_storage& out_ss, int& out_len) {
+    if (!guest_sa || len < 2 || len > static_cast<int>(sizeof(sockaddr_storage))) return false;
+    std::memset(&out_ss, 0, sizeof(out_ss));
+    std::memcpy(&out_ss, guest_sa, static_cast<size_t>(len));
+    out_ss.ss_family = static_cast<ADDRESS_FAMILY>(LinuxAfToWin(out_ss.ss_family));
+    out_len = len;
+    return true;
+}
+
+void CopyWinSockaddrToLinux(const sockaddr_storage& ss, int ss_len, void* guest_sa, uint32_t* guest_len) {
+    if (!guest_sa || !guest_len) return;
+    sockaddr_storage tmp = ss;
+    tmp.ss_family = static_cast<ADDRESS_FAMILY>(WinAfToLinux(tmp.ss_family));
+    int copy_n = std::min<int>(static_cast<int>(*guest_len), ss_len);
+    if (copy_n > 0) std::memcpy(guest_sa, &tmp, static_cast<size_t>(copy_n));
+    *guest_len = static_cast<uint32_t>(ss_len);
+}
 
 int MapWinErrnoToLinux(int e) {
     switch (e) {
@@ -674,6 +827,17 @@ int* BionicRuntime::ThreadErrnoPtr() { return &tls_bionic_errno; }
 BionicRuntime::BionicRuntime(CpuRuntime& cpu, ElfLoader& loader, LayeredVfs& vfs)
     : cpu_(cpu), loader_(loader), vfs_(vfs) {
     InitCtypeTable();
+}
+
+void BionicRuntime::SetOnlineMode(bool enabled) {
+    online_mode_ = enabled;
+    if (enabled) {
+        static std::once_flag wsa_once;
+        std::call_once(wsa_once, []() {
+            WSADATA wd{};
+            WSAStartup(MAKEWORD(2, 2), &wd);
+        });
+    }
 }
 
 void BionicRuntime::RegisterAll() {
@@ -1695,10 +1859,52 @@ void BionicRuntime::RegisterAll() {
     };
     fn("open", do_open);
     fn("__open_2", do_open);
-    fn("close", [](CpuContext& c) { int r = _close(static_cast<int>(c.GetW(0))); if (r < 0) SyncErrno(); c.SetW(0, static_cast<uint32_t>(r)); });
-    fn("read", [](CpuContext& c) { int r = _read(static_cast<int>(c.GetW(0)), reinterpret_cast<void*>(c.GetX(1)), static_cast<unsigned int>(c.GetX(2))); if (r < 0) SyncErrno(); c.SetX(0, static_cast<uint64_t>(static_cast<int64_t>(r))); });
-    fn("__read_chk", [](CpuContext& c) { int r = _read(static_cast<int>(c.GetW(0)), reinterpret_cast<void*>(c.GetX(1)), static_cast<unsigned int>(c.GetX(2))); if (r < 0) SyncErrno(); c.SetX(0, static_cast<uint64_t>(static_cast<int64_t>(r))); });
-    fn("write", [](CpuContext& c) { int r = _write(static_cast<int>(c.GetW(0)), reinterpret_cast<const void*>(c.GetX(1)), static_cast<unsigned int>(c.GetX(2))); if (r < 0) SyncErrno(); c.SetX(0, static_cast<uint64_t>(static_cast<int64_t>(r))); });
+    fn("close", [](CpuContext& c) {
+        int fd = static_cast<int>(c.GetW(0));
+        if (CloseVirtSocket(fd)) { c.SetW(0, 0); return; }
+        int r = _close(fd);
+        if (r < 0) SyncErrno();
+        c.SetW(0, static_cast<uint32_t>(r));
+    });
+    fn("read", [](CpuContext& c) {
+        int fd = static_cast<int>(c.GetW(0));
+        SOCKET s = INVALID_SOCKET;
+        if (LookupVirtSocket(fd, s)) {
+            int r = ::recv(s, reinterpret_cast<char*>(c.GetX(1)), static_cast<int>(c.GetW(2)), 0);
+            if (r == SOCKET_ERROR) { SyncWsaErrno(); c.SetX(0, static_cast<uint64_t>(-1LL)); return; }
+            c.SetX(0, static_cast<uint64_t>(static_cast<int64_t>(r)));
+            return;
+        }
+        int r = _read(fd, reinterpret_cast<void*>(c.GetX(1)), static_cast<unsigned int>(c.GetW(2)));
+        if (r < 0) SyncErrno();
+        c.SetX(0, static_cast<uint64_t>(static_cast<int64_t>(r)));
+    });
+    fn("__read_chk", [](CpuContext& c) {
+        int fd = static_cast<int>(c.GetW(0));
+        SOCKET s = INVALID_SOCKET;
+        if (LookupVirtSocket(fd, s)) {
+            int r = ::recv(s, reinterpret_cast<char*>(c.GetX(1)), static_cast<int>(c.GetW(2)), 0);
+            if (r == SOCKET_ERROR) { SyncWsaErrno(); c.SetX(0, static_cast<uint64_t>(-1LL)); return; }
+            c.SetX(0, static_cast<uint64_t>(static_cast<int64_t>(r)));
+            return;
+        }
+        int r = _read(fd, reinterpret_cast<void*>(c.GetX(1)), static_cast<unsigned int>(c.GetW(2)));
+        if (r < 0) SyncErrno();
+        c.SetX(0, static_cast<uint64_t>(static_cast<int64_t>(r)));
+    });
+    fn("write", [](CpuContext& c) {
+        int fd = static_cast<int>(c.GetW(0));
+        SOCKET s = INVALID_SOCKET;
+        if (LookupVirtSocket(fd, s)) {
+            int r = ::send(s, reinterpret_cast<const char*>(c.GetX(1)), static_cast<int>(c.GetW(2)), 0);
+            if (r == SOCKET_ERROR) { SyncWsaErrno(); c.SetX(0, static_cast<uint64_t>(-1LL)); return; }
+            c.SetX(0, static_cast<uint64_t>(static_cast<int64_t>(r)));
+            return;
+        }
+        int r = _write(fd, reinterpret_cast<const void*>(c.GetX(1)), static_cast<unsigned int>(c.GetW(2)));
+        if (r < 0) SyncErrno();
+        c.SetX(0, static_cast<uint64_t>(static_cast<int64_t>(r)));
+    });
     fn("lseek64", [](CpuContext& c) { int64_t r = _lseeki64(static_cast<int>(c.GetW(0)), static_cast<int64_t>(c.GetX(1)), static_cast<int>(c.GetW(2))); if (r < 0) SyncErrno(); c.SetX(0, static_cast<uint64_t>(r)); });
     fn("fsync", [](CpuContext& c) { c.SetW(0, static_cast<uint32_t>(_commit(static_cast<int>(c.GetW(0))))); });
     fn("ftruncate", [](CpuContext& c) { c.SetW(0, static_cast<uint32_t>(_chsize_s(static_cast<int>(c.GetW(0)), static_cast<int64_t>(c.GetX(1))) == 0 ? 0 : -1)); });
@@ -1710,8 +1916,56 @@ void BionicRuntime::RegisterAll() {
         std::filesystem::resize_file(hp, static_cast<uintmax_t>(c.GetX(1)), ec);
         c.SetW(0, ec ? static_cast<uint32_t>(-1) : 0u);
     });
-    fn("fcntl", [](CpuContext& c) { c.SetW(0, 0); });
-    fn("ioctl", [](CpuContext& c) { c.SetW(0, 0); });
+    fn("fcntl", [](CpuContext& c) {
+        int fd = static_cast<int>(c.GetW(0));
+        int cmd = static_cast<int>(c.GetW(1));
+        uint64_t arg = c.GetX(2);
+        SOCKET s = INVALID_SOCKET;
+        if (LookupVirtSocket(fd, s)) {
+            if (cmd == 3) { // F_GETFL
+                std::lock_guard<std::mutex> lk(g_sock_mtx);
+                c.SetW(0, g_virt_nonblock[fd] ? 0x802u : 0x2u);
+                return;
+            }
+            if (cmd == 4) { // F_SETFL
+                bool nb = (arg & 0x800ULL) != 0;
+                u_long mode = nb ? 1u : 0u;
+                ioctlsocket(s, FIONBIO, &mode);
+                std::lock_guard<std::mutex> lk(g_sock_mtx);
+                g_virt_nonblock[fd] = nb;
+                c.SetW(0, 0);
+                return;
+            }
+        }
+        c.SetW(0, 0);
+    });
+    fn("ioctl", [](CpuContext& c) {
+        int fd = static_cast<int>(c.GetW(0));
+        uint32_t req = c.GetW(1);
+        SOCKET s = INVALID_SOCKET;
+        if (LookupVirtSocket(fd, s)) {
+            if (req == 0x5421u) { // Linux FIONBIO
+                int* pval = reinterpret_cast<int*>(c.GetX(2));
+                u_long mode = (pval && *pval) ? 1u : 0u;
+                int r = ioctlsocket(s, FIONBIO, &mode);
+                if (r == 0) {
+                    std::lock_guard<std::mutex> lk(g_sock_mtx);
+                    g_virt_nonblock[fd] = (mode != 0);
+                }
+                c.SetW(0, static_cast<uint32_t>(r));
+                return;
+            }
+            if (req == 0x541Bu) { // Linux FIONREAD
+                u_long avail = 0;
+                int r = ioctlsocket(s, FIONREAD, &avail);
+                int* pval = reinterpret_cast<int*>(c.GetX(2));
+                if (r == 0 && pval) *pval = static_cast<int>(avail);
+                c.SetW(0, static_cast<uint32_t>(r));
+                return;
+            }
+        }
+        c.SetW(0, 0);
+    });
     fn("pipe", [](CpuContext& c) {
         int* fds = reinterpret_cast<int*>(c.GetX(0));
         int r = _pipe(fds, 4096, _O_BINARY);
@@ -2274,49 +2528,445 @@ void BionicRuntime::RegisterAll() {
         c.SetW(0, static_cast<uint32_t>(rc));
     });
 
-    // ---- Offline-gated sockets / network (ZERO outbound packets!) ----
-    // Use 64-bit -1LL in X0 so both 32-bit int (socket/connect) and 64-bit ssize_t (send/recv) see -1.
+    // ---- Sockets / network (strictly offline by default; real Winsock2 bridge when online_mode_ is true) ----
     auto net_fail = [](CpuContext& c) { tls_bionic_errno = 101; c.SetX(0, static_cast<uint64_t>(-1LL)); }; // ENETUNREACH
-    fn("socket", net_fail);
-    fn("connect", net_fail);
-    fn("bind", net_fail);
-    fn("listen", net_fail);
-    fn("accept", net_fail);
-    fn("send", net_fail);
-    fn("sendto", net_fail);
-    fn("sendmmsg", net_fail);
-    fn("recv", net_fail);
-    fn("recvfrom", net_fail);
-    fn("recvmmsg", net_fail);
-    fn("shutdown", net_fail);
-    fn("getsockopt", net_fail);
-    fn("setsockopt", net_fail);
-    fn("getsockname", net_fail);
-    fn("getpeername", net_fail);
-    fn("poll", [](CpuContext& c) {
-        int timeout_ms = static_cast<int>(c.GetW(2));
-        if (timeout_ms < 0) Sleep(50);
-        else if (timeout_ms > 0) Sleep(static_cast<DWORD>(std::min(timeout_ms, 50)));
-        c.SetW(0, 0);
+    fn("socket", [this, net_fail](CpuContext& c) {
+        if (!online_mode_) { net_fail(c); return; }
+        int domain = LinuxAfToWin(static_cast<int>(c.GetW(0)));
+        int raw_type = static_cast<int>(c.GetW(1));
+        int proto = static_cast<int>(c.GetW(2));
+        bool nonblock = (raw_type & 0x800) != 0; // Linux SOCK_NONBLOCK
+        int type = raw_type & 0xF;
+        SOCKET s = ::socket(domain, type, proto);
+        if (s == INVALID_SOCKET) { SyncWsaErrno(); c.SetX(0, static_cast<uint64_t>(-1LL)); return; }
+        if (nonblock) {
+            u_long mode = 1;
+            ioctlsocket(s, FIONBIO, &mode);
+        }
+        int vfd = AllocVirtSocketFd(s, nonblock);
+        if (vfd < 0) {
+            closesocket(s);
+            tls_bionic_errno = 24; // EMFILE
+            c.SetW(0, static_cast<uint32_t>(-1));
+            return;
+        }
+        c.SetW(0, static_cast<uint32_t>(vfd));
     });
-    fn("select", [](CpuContext& c) {
-        auto* tv = reinterpret_cast<const int64_t*>(c.GetX(4));
-        if (!tv) {
-            Sleep(50);
-        } else {
-            int64_t ms = tv[0] * 1000 + tv[1] / 1000;
-            if (ms > 0) Sleep(static_cast<DWORD>(std::min<int64_t>(ms, 50)));
+    fn("connect", [this, net_fail](CpuContext& c) {
+        if (!online_mode_) { net_fail(c); return; }
+        SOCKET s = INVALID_SOCKET;
+        if (!LookupVirtSocket(static_cast<int>(c.GetW(0)), s)) { tls_bionic_errno = 9; c.SetW(0, static_cast<uint32_t>(-1)); return; }
+        sockaddr_storage ss{};
+        int slen = 0;
+        if (!CopyLinuxSockaddrToWin(reinterpret_cast<const void*>(c.GetX(1)), static_cast<int>(c.GetW(2)), ss, slen)) {
+            tls_bionic_errno = 22; c.SetW(0, static_cast<uint32_t>(-1)); return;
+        }
+        int r = ::connect(s, reinterpret_cast<const sockaddr*>(&ss), slen);
+        if (r == SOCKET_ERROR) {
+            int werr = WSAGetLastError();
+            tls_bionic_errno = (werr == WSAEWOULDBLOCK) ? 115 : WsaToLinuxErrno(werr); // EINPROGRESS for non-blocking connect
+            c.SetW(0, static_cast<uint32_t>(-1));
+            return;
         }
         c.SetW(0, 0);
     });
-    fn("__FD_SET_chk", [](CpuContext&) {});
-    fn("__FD_ISSET_chk", [](CpuContext& c) { c.SetW(0, 0); });
+    fn("bind", [this, net_fail](CpuContext& c) {
+        if (!online_mode_) { net_fail(c); return; }
+        SOCKET s = INVALID_SOCKET;
+        if (!LookupVirtSocket(static_cast<int>(c.GetW(0)), s)) { tls_bionic_errno = 9; c.SetW(0, static_cast<uint32_t>(-1)); return; }
+        sockaddr_storage ss{};
+        int slen = 0;
+        if (!CopyLinuxSockaddrToWin(reinterpret_cast<const void*>(c.GetX(1)), static_cast<int>(c.GetW(2)), ss, slen)) {
+            tls_bionic_errno = 22; c.SetW(0, static_cast<uint32_t>(-1)); return;
+        }
+        int r = ::bind(s, reinterpret_cast<const sockaddr*>(&ss), slen);
+        if (r == SOCKET_ERROR) { SyncWsaErrno(); c.SetW(0, static_cast<uint32_t>(-1)); return; }
+        c.SetW(0, 0);
+    });
+    fn("listen", [this, net_fail](CpuContext& c) {
+        if (!online_mode_) { net_fail(c); return; }
+        SOCKET s = INVALID_SOCKET;
+        if (!LookupVirtSocket(static_cast<int>(c.GetW(0)), s)) { tls_bionic_errno = 9; c.SetW(0, static_cast<uint32_t>(-1)); return; }
+        int r = ::listen(s, static_cast<int>(c.GetW(1)));
+        if (r == SOCKET_ERROR) { SyncWsaErrno(); c.SetW(0, static_cast<uint32_t>(-1)); return; }
+        c.SetW(0, 0);
+    });
+    fn("accept", [this, net_fail](CpuContext& c) {
+        if (!online_mode_) { net_fail(c); return; }
+        SOCKET s = INVALID_SOCKET;
+        if (!LookupVirtSocket(static_cast<int>(c.GetW(0)), s)) { tls_bionic_errno = 9; c.SetW(0, static_cast<uint32_t>(-1)); return; }
+        sockaddr_storage ss{};
+        int slen = sizeof(ss);
+        SOCKET ns = ::accept(s, reinterpret_cast<sockaddr*>(&ss), &slen);
+        if (ns == INVALID_SOCKET) { SyncWsaErrno(); c.SetW(0, static_cast<uint32_t>(-1)); return; }
+        int vfd = AllocVirtSocketFd(ns, false);
+        if (vfd < 0) {
+            closesocket(ns);
+            tls_bionic_errno = 24; // EMFILE
+            c.SetW(0, static_cast<uint32_t>(-1));
+            return;
+        }
+        CopyWinSockaddrToLinux(ss, slen, reinterpret_cast<void*>(c.GetX(1)), reinterpret_cast<uint32_t*>(c.GetX(2)));
+        c.SetW(0, static_cast<uint32_t>(vfd));
+    });
+    fn("send", [this, net_fail](CpuContext& c) {
+        if (!online_mode_) { net_fail(c); return; }
+        SOCKET s = INVALID_SOCKET;
+        if (!LookupVirtSocket(static_cast<int>(c.GetW(0)), s)) { tls_bionic_errno = 9; c.SetX(0, static_cast<uint64_t>(-1LL)); return; }
+        int r = ::send(s, reinterpret_cast<const char*>(c.GetX(1)), static_cast<int>(c.GetX(2)), 0);
+        if (r == SOCKET_ERROR) { SyncWsaErrno(); c.SetX(0, static_cast<uint64_t>(-1LL)); return; }
+        c.SetX(0, static_cast<uint64_t>(static_cast<int64_t>(r)));
+    });
+    fn("sendto", [this, net_fail](CpuContext& c) {
+        if (!online_mode_) { net_fail(c); return; }
+        SOCKET s = INVALID_SOCKET;
+        if (!LookupVirtSocket(static_cast<int>(c.GetW(0)), s)) { tls_bionic_errno = 9; c.SetX(0, static_cast<uint64_t>(-1LL)); return; }
+        const void* dst = reinterpret_cast<const void*>(c.GetX(4));
+        int r = SOCKET_ERROR;
+        if (dst) {
+            sockaddr_storage ss{};
+            int slen = 0;
+            if (!CopyLinuxSockaddrToWin(dst, static_cast<int>(c.GetW(5)), ss, slen)) {
+                tls_bionic_errno = 22; c.SetX(0, static_cast<uint64_t>(-1LL)); return;
+            }
+            r = ::sendto(s, reinterpret_cast<const char*>(c.GetX(1)), static_cast<int>(c.GetX(2)), 0,
+                         reinterpret_cast<const sockaddr*>(&ss), slen);
+        } else {
+            r = ::send(s, reinterpret_cast<const char*>(c.GetX(1)), static_cast<int>(c.GetX(2)), 0);
+        }
+        if (r == SOCKET_ERROR) { SyncWsaErrno(); c.SetX(0, static_cast<uint64_t>(-1LL)); return; }
+        c.SetX(0, static_cast<uint64_t>(static_cast<int64_t>(r)));
+    });
+    fn("sendmmsg", net_fail);
+    fn("recv", [this, net_fail](CpuContext& c) {
+        if (!online_mode_) { net_fail(c); return; }
+        SOCKET s = INVALID_SOCKET;
+        if (!LookupVirtSocket(static_cast<int>(c.GetW(0)), s)) { tls_bionic_errno = 9; c.SetX(0, static_cast<uint64_t>(-1LL)); return; }
+        int lflags = static_cast<int>(c.GetW(3));
+        int wflags = (lflags & 2) ? MSG_PEEK : 0;
+        int r = ::recv(s, reinterpret_cast<char*>(c.GetX(1)), static_cast<int>(c.GetX(2)), wflags);
+        if (r == SOCKET_ERROR) { SyncWsaErrno(); c.SetX(0, static_cast<uint64_t>(-1LL)); return; }
+        c.SetX(0, static_cast<uint64_t>(static_cast<int64_t>(r)));
+    });
+    fn("recvfrom", [this, net_fail](CpuContext& c) {
+        if (!online_mode_) { net_fail(c); return; }
+        SOCKET s = INVALID_SOCKET;
+        if (!LookupVirtSocket(static_cast<int>(c.GetW(0)), s)) { tls_bionic_errno = 9; c.SetX(0, static_cast<uint64_t>(-1LL)); return; }
+        int lflags = static_cast<int>(c.GetW(3));
+        int wflags = (lflags & 2) ? MSG_PEEK : 0;
+        sockaddr_storage ss{};
+        int slen = sizeof(ss);
+        void* src_addr = reinterpret_cast<void*>(c.GetX(4));
+        uint32_t* src_len = reinterpret_cast<uint32_t*>(c.GetX(5));
+        int r = src_addr
+                    ? ::recvfrom(s, reinterpret_cast<char*>(c.GetX(1)), static_cast<int>(c.GetX(2)), wflags,
+                                 reinterpret_cast<sockaddr*>(&ss), &slen)
+                    : ::recv(s, reinterpret_cast<char*>(c.GetX(1)), static_cast<int>(c.GetX(2)), wflags);
+        if (r == SOCKET_ERROR) { SyncWsaErrno(); c.SetX(0, static_cast<uint64_t>(-1LL)); return; }
+        if (src_addr && src_len) CopyWinSockaddrToLinux(ss, slen, src_addr, src_len);
+        c.SetX(0, static_cast<uint64_t>(static_cast<int64_t>(r)));
+    });
+    fn("recvmmsg", net_fail);
+    fn("shutdown", [this, net_fail](CpuContext& c) {
+        if (!online_mode_) { net_fail(c); return; }
+        SOCKET s = INVALID_SOCKET;
+        if (!LookupVirtSocket(static_cast<int>(c.GetW(0)), s)) { tls_bionic_errno = 9; c.SetW(0, static_cast<uint32_t>(-1)); return; }
+        int r = ::shutdown(s, static_cast<int>(c.GetW(1)));
+        if (r == SOCKET_ERROR) { SyncWsaErrno(); c.SetW(0, static_cast<uint32_t>(-1)); return; }
+        c.SetW(0, 0);
+    });
+    fn("getsockopt", [this, net_fail](CpuContext& c) {
+        if (!online_mode_) { net_fail(c); return; }
+        SOCKET s = INVALID_SOCKET;
+        if (!LookupVirtSocket(static_cast<int>(c.GetW(0)), s)) { tls_bionic_errno = 9; c.SetW(0, static_cast<uint32_t>(-1)); return; }
+        int level = static_cast<int>(c.GetW(1));
+        int opt = static_cast<int>(c.GetW(2));
+        void* val = reinterpret_cast<void*>(c.GetX(3));
+        uint32_t* lenp = reinterpret_cast<uint32_t*>(c.GetX(4));
+        if (level == 1 && opt == 4 && val && lenp && *lenp >= 4) { // SOL_SOCKET + SO_ERROR
+            int werr = 0; int wlen = sizeof(werr);
+            int r = ::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&werr), &wlen);
+            if (r == SOCKET_ERROR) { SyncWsaErrno(); c.SetW(0, static_cast<uint32_t>(-1)); return; }
+            *reinterpret_cast<int32_t*>(val) = WsaToLinuxErrno(werr);
+            *lenp = 4;
+            c.SetW(0, 0);
+            return;
+        }
+        c.SetW(0, 0);
+    });
+    fn("setsockopt", [this, net_fail](CpuContext& c) {
+        if (!online_mode_) { net_fail(c); return; }
+        SOCKET s = INVALID_SOCKET;
+        if (!LookupVirtSocket(static_cast<int>(c.GetW(0)), s)) { tls_bionic_errno = 9; c.SetW(0, static_cast<uint32_t>(-1)); return; }
+        int level = static_cast<int>(c.GetW(1));
+        int opt = static_cast<int>(c.GetW(2));
+        const void* val = reinterpret_cast<const void*>(c.GetX(3));
+        int len = static_cast<int>(c.GetW(4));
+        if (level == 1) { // Linux SOL_SOCKET
+            if ((opt == 20 || opt == 21) && val && len >= 16) { // SO_RCVTIMEO / SO_SNDTIMEO
+                const auto* tv = reinterpret_cast<const LinuxTimeval*>(val);
+                DWORD ms = static_cast<DWORD>(std::max<int64_t>(0, tv->tv_sec * 1000 + tv->tv_usec / 1000));
+                ::setsockopt(s, SOL_SOCKET, opt == 20 ? SO_RCVTIMEO : SO_SNDTIMEO,
+                             reinterpret_cast<const char*>(&ms), sizeof(ms));
+            } else if (opt == 2 && val && len >= 4) { // SO_REUSEADDR
+                ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(val), 4);
+            } else if (opt == 9 && val && len >= 4) { // SO_KEEPALIVE
+                ::setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(val), 4);
+            } else if (opt == 7 && val && len >= 4) { // SO_SNDBUF
+                ::setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(val), 4);
+            } else if (opt == 8 && val && len >= 4) { // SO_RCVBUF
+                ::setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(val), 4);
+            }
+        } else if (level == IPPROTO_TCP && opt == 1 && val && len >= 4) { // TCP_NODELAY
+            ::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(val), 4);
+        }
+        c.SetW(0, 0);
+    });
+    fn("getsockname", [this, net_fail](CpuContext& c) {
+        if (!online_mode_) { net_fail(c); return; }
+        SOCKET s = INVALID_SOCKET;
+        if (!LookupVirtSocket(static_cast<int>(c.GetW(0)), s)) { tls_bionic_errno = 9; c.SetW(0, static_cast<uint32_t>(-1)); return; }
+        sockaddr_storage ss{}; int slen = sizeof(ss);
+        if (::getsockname(s, reinterpret_cast<sockaddr*>(&ss), &slen) == SOCKET_ERROR) {
+            SyncWsaErrno(); c.SetW(0, static_cast<uint32_t>(-1)); return;
+        }
+        CopyWinSockaddrToLinux(ss, slen, reinterpret_cast<void*>(c.GetX(1)), reinterpret_cast<uint32_t*>(c.GetX(2)));
+        c.SetW(0, 0);
+    });
+    fn("getpeername", [this, net_fail](CpuContext& c) {
+        if (!online_mode_) { net_fail(c); return; }
+        SOCKET s = INVALID_SOCKET;
+        if (!LookupVirtSocket(static_cast<int>(c.GetW(0)), s)) { tls_bionic_errno = 9; c.SetW(0, static_cast<uint32_t>(-1)); return; }
+        sockaddr_storage ss{}; int slen = sizeof(ss);
+        if (::getpeername(s, reinterpret_cast<sockaddr*>(&ss), &slen) == SOCKET_ERROR) {
+            SyncWsaErrno(); c.SetW(0, static_cast<uint32_t>(-1)); return;
+        }
+        CopyWinSockaddrToLinux(ss, slen, reinterpret_cast<void*>(c.GetX(1)), reinterpret_cast<uint32_t*>(c.GetX(2)));
+        c.SetW(0, 0);
+    });
+    fn("poll", [this](CpuContext& c) {
+        auto* pfds = reinterpret_cast<LinuxPollFd*>(c.GetX(0));
+        uint32_t nfds = c.GetW(1);
+        int timeout_ms = static_cast<int>(c.GetW(2));
+        if (!online_mode_ || !pfds || nfds == 0) {
+            if (timeout_ms < 0) Sleep(50);
+            else if (timeout_ms > 0) Sleep(static_cast<DWORD>(std::min(timeout_ms, 50)));
+            c.SetW(0, 0);
+            return;
+        }
+        std::vector<WSAPOLLFD> wfds(nfds);
+        bool has_sock = false;
+        for (uint32_t i = 0; i < nfds; ++i) {
+            pfds[i].revents = 0;
+            SOCKET s = INVALID_SOCKET;
+            if (LookupVirtSocket(pfds[i].fd, s)) {
+                wfds[i].fd = s;
+                SHORT ev = 0;
+                if (pfds[i].events & 0x001) ev |= POLLRDNORM;
+                if (pfds[i].events & 0x004) ev |= POLLWRNORM;
+                wfds[i].events = ev;
+                wfds[i].revents = 0;
+                has_sock = true;
+            } else {
+                wfds[i].fd = INVALID_SOCKET;
+                wfds[i].events = 0;
+                wfds[i].revents = 0;
+            }
+        }
+        if (!has_sock) {
+            if (timeout_ms > 0) Sleep(static_cast<DWORD>(std::min(timeout_ms, 50)));
+            c.SetW(0, 0);
+            return;
+        }
+        int r = WSAPoll(wfds.data(), nfds, timeout_ms);
+        if (r == SOCKET_ERROR) { SyncWsaErrno(); c.SetW(0, static_cast<uint32_t>(-1)); return; }
+        for (uint32_t i = 0; i < nfds; ++i) {
+            int16_t rev = 0;
+            if (wfds[i].revents & (POLLRDNORM | POLLRDBAND)) rev |= 0x001; // POLLIN
+            if (wfds[i].revents & POLLWRNORM) rev |= 0x004;                // POLLOUT
+            if (wfds[i].revents & POLLERR) rev |= 0x008;                   // POLLERR
+            if (wfds[i].revents & POLLHUP) rev |= 0x010;                   // POLLHUP
+            if (wfds[i].revents & POLLNVAL) rev |= 0x020;                  // POLLNVAL
+            pfds[i].revents = rev;
+        }
+        c.SetW(0, static_cast<uint32_t>(r));
+    });
+    fn("select", [this](CpuContext& c) {
+        int nfds = static_cast<int>(c.GetW(0));
+        auto* rfds = reinterpret_cast<uint64_t*>(c.GetX(1));
+        auto* wfds = reinterpret_cast<uint64_t*>(c.GetX(2));
+        auto* efds = reinterpret_cast<uint64_t*>(c.GetX(3));
+        auto* ltv = reinterpret_cast<const LinuxTimeval*>(c.GetX(4));
+        if (!online_mode_) {
+            if (!ltv) Sleep(50);
+            else {
+                int64_t ms = ltv->tv_sec * 1000 + ltv->tv_usec / 1000;
+                if (ms > 0) Sleep(static_cast<DWORD>(std::min<int64_t>(ms, 50)));
+            }
+            c.SetW(0, 0);
+            return;
+        }
+        // Linux fd_set supports FDs 0..1023; virtual sockets use FD>=10000 so poll() is preferred,
+        // but support any FD < 1024 cleanly and cap idle sleep cleanly.
+        fd_set wr{}, ww{}, we{};
+        FD_ZERO(&wr); FD_ZERO(&ww); FD_ZERO(&we);
+        std::vector<std::pair<int, SOCKET>> tracked;
+        int limit = std::min(nfds, 1024);
+        auto check_set = [&](uint64_t* bits, fd_set& dst) {
+            if (!bits) return;
+            for (int fd = 0; fd < limit; ++fd) {
+                if (bits[fd / 64] & (1ULL << (fd % 64))) {
+                    SOCKET s = INVALID_SOCKET;
+                    if (LookupVirtSocket(fd, s)) {
+                        FD_SET(s, &dst);
+                        tracked.emplace_back(fd, s);
+                    }
+                }
+            }
+        };
+        check_set(rfds, wr);
+        check_set(wfds, ww);
+        check_set(efds, we);
+        if (tracked.empty()) {
+            if (ltv) {
+                int64_t ms = ltv->tv_sec * 1000 + ltv->tv_usec / 1000;
+                if (ms > 0) Sleep(static_cast<DWORD>(std::min<int64_t>(ms, 50)));
+            }
+            c.SetW(0, 0);
+            return;
+        }
+        timeval wtv{};
+        timeval* ptv = nullptr;
+        if (ltv) {
+            wtv.tv_sec = static_cast<long>(ltv->tv_sec);
+            wtv.tv_usec = static_cast<long>(ltv->tv_usec);
+            ptv = &wtv;
+        }
+        int r = ::select(0, rfds ? &wr : nullptr, wfds ? &ww : nullptr, efds ? &we : nullptr, ptv);
+        if (r == SOCKET_ERROR) { SyncWsaErrno(); c.SetW(0, static_cast<uint32_t>(-1)); return; }
+        auto write_back = [&](uint64_t* bits, fd_set& src) {
+            if (!bits) return;
+            std::memset(bits, 0, 128);
+            for (auto [fd, s] : tracked) {
+                if (FD_ISSET(s, &src)) bits[fd / 64] |= (1ULL << (fd % 64));
+            }
+        };
+        write_back(rfds, wr);
+        write_back(wfds, ww);
+        write_back(efds, we);
+        c.SetW(0, static_cast<uint32_t>(r));
+    });
+    fn("__FD_SET_chk", [](CpuContext& c) {
+        int fd = static_cast<int>(c.GetW(0));
+        auto* bits = reinterpret_cast<uint64_t*>(c.GetX(1));
+        if (bits && fd >= 0 && fd < 1024) bits[fd / 64] |= (1ULL << (fd % 64));
+    });
+    fn("__FD_ISSET_chk", [](CpuContext& c) {
+        int fd = static_cast<int>(c.GetW(0));
+        auto* bits = reinterpret_cast<const uint64_t*>(c.GetX(1));
+        int set = (bits && fd >= 0 && fd < 1024 && (bits[fd / 64] & (1ULL << (fd % 64)))) ? 1 : 0;
+        c.SetW(0, static_cast<uint32_t>(set));
+    });
     fn("__cmsg_nxthdr", [](CpuContext& c) { c.SetX(0, 0); });
-    fn("getaddrinfo", [](CpuContext& c) { c.SetW(0, static_cast<uint32_t>(-2)); }); // EAI_NONAME
-    fn("freeaddrinfo", [](CpuContext&) {});
-    fn("gai_strerror", [](CpuContext& c) { static const char* s = "offline"; c.SetX(0, reinterpret_cast<uint64_t>(s)); });
-    fn("gethostbyname", [](CpuContext& c) { c.SetX(0, 0); });
-    fn("getnameinfo", [](CpuContext& c) { c.SetW(0, static_cast<uint32_t>(-2)); });
+    fn("getaddrinfo", [this](CpuContext& c) {
+        if (!online_mode_) { c.SetW(0, static_cast<uint32_t>(-2)); return; }
+        const char* node = reinterpret_cast<const char*>(c.GetX(0));
+        const char* service = reinterpret_cast<const char*>(c.GetX(1));
+        const auto* lhints = reinterpret_cast<const LinuxAddrinfo*>(c.GetX(2));
+        auto** res_out = reinterpret_cast<LinuxAddrinfo**>(c.GetX(3));
+        if (!res_out) { c.SetW(0, static_cast<uint32_t>(-1)); return; }
+        *res_out = nullptr;
+        addrinfo whints{};
+        if (lhints) {
+            whints.ai_flags = lhints->ai_flags;
+            whints.ai_family = LinuxAfToWin(lhints->ai_family);
+            whints.ai_socktype = lhints->ai_socktype;
+            whints.ai_protocol = lhints->ai_protocol;
+        }
+        addrinfo* wres = nullptr;
+        int rc = ::getaddrinfo(node, service, lhints ? &whints : nullptr, &wres);
+        if (rc != 0 || !wres) { c.SetW(0, static_cast<uint32_t>(-2)); return; }
+        LinuxAddrinfo* head = nullptr;
+        LinuxAddrinfo* tail = nullptr;
+        for (addrinfo* cur = wres; cur; cur = cur->ai_next) {
+            auto* la = new LinuxAddrinfo{};
+            la->ai_flags = cur->ai_flags;
+            la->ai_family = WinAfToLinux(cur->ai_family);
+            la->ai_socktype = cur->ai_socktype;
+            la->ai_protocol = cur->ai_protocol;
+            la->ai_addrlen = static_cast<uint32_t>(cur->ai_addrlen);
+            if (cur->ai_addr && cur->ai_addrlen > 0) {
+                auto* sa_copy = new uint8_t[cur->ai_addrlen];
+                std::memcpy(sa_copy, cur->ai_addr, cur->ai_addrlen);
+                uint16_t fam = static_cast<uint16_t>(WinAfToLinux(cur->ai_addr->sa_family));
+                std::memcpy(sa_copy, &fam, 2);
+                la->ai_addr = reinterpret_cast<uint64_t>(sa_copy);
+            }
+            if (cur->ai_canonname) {
+                size_t clen = std::strlen(cur->ai_canonname) + 1;
+                char* cn = new char[clen];
+                std::memcpy(cn, cur->ai_canonname, clen);
+                la->ai_canonname = reinterpret_cast<uint64_t>(cn);
+            }
+            if (!head) head = la;
+            if (tail) tail->ai_next = reinterpret_cast<uint64_t>(la);
+            tail = la;
+        }
+        ::freeaddrinfo(wres);
+        *res_out = head;
+        c.SetW(0, 0);
+    });
+    fn("freeaddrinfo", [](CpuContext& c) {
+        auto* cur = reinterpret_cast<LinuxAddrinfo*>(c.GetX(0));
+        while (cur) {
+            auto* nxt = reinterpret_cast<LinuxAddrinfo*>(cur->ai_next);
+            delete[] reinterpret_cast<uint8_t*>(cur->ai_addr);
+            delete[] reinterpret_cast<char*>(cur->ai_canonname);
+            delete cur;
+            cur = nxt;
+        }
+    });
+    fn("gai_strerror", [](CpuContext& c) {
+        static const char* s = "name resolution failed";
+        c.SetX(0, reinterpret_cast<uint64_t>(s));
+    });
+    fn("gethostbyname", [this](CpuContext& c) {
+        if (!online_mode_) { c.SetX(0, 0); return; }
+        const char* name = reinterpret_cast<const char*>(c.GetX(0));
+        if (!name) { c.SetX(0, 0); return; }
+        addrinfo hints{};
+        hints.ai_family = AF_INET;
+        addrinfo* res = nullptr;
+        if (::getaddrinfo(name, nullptr, &hints, &res) != 0 || !res) { c.SetX(0, 0); return; }
+        thread_local LinuxHostent he{};
+        thread_local char name_buf[256]{};
+        thread_local uint32_t ipv4_addr = 0;
+        thread_local uint64_t addr_ptrs[2]{};
+        thread_local uint64_t alias_ptrs[1]{0};
+        std::strncpy(name_buf, name, sizeof(name_buf) - 1);
+        ipv4_addr = reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr.s_addr;
+        ::freeaddrinfo(res);
+        addr_ptrs[0] = reinterpret_cast<uint64_t>(&ipv4_addr);
+        addr_ptrs[1] = 0;
+        he.h_name = reinterpret_cast<uint64_t>(name_buf);
+        he.h_aliases = reinterpret_cast<uint64_t>(alias_ptrs);
+        he.h_addrtype = AF_INET;
+        he.h_length = 4;
+        he.h_addr_list = reinterpret_cast<uint64_t>(addr_ptrs);
+        c.SetX(0, reinterpret_cast<uint64_t>(&he));
+    });
+    fn("getnameinfo", [this](CpuContext& c) {
+        if (!online_mode_) { c.SetW(0, static_cast<uint32_t>(-2)); return; }
+        sockaddr_storage ss{}; int slen = 0;
+        if (!CopyLinuxSockaddrToWin(reinterpret_cast<const void*>(c.GetX(0)), static_cast<int>(c.GetW(1)), ss, slen)) {
+            c.SetW(0, static_cast<uint32_t>(-2)); return;
+        }
+        int rc = ::getnameinfo(reinterpret_cast<const sockaddr*>(&ss), slen,
+                               reinterpret_cast<char*>(c.GetX(2)), static_cast<DWORD>(c.GetW(3)),
+                               reinterpret_cast<char*>(c.GetX(4)), static_cast<DWORD>(c.GetW(5)),
+                               static_cast<int>(c.GetW(6)));
+        c.SetW(0, static_cast<uint32_t>(rc));
+    });
     fn("gethostname", [](CpuContext& c) {
         char* buf = reinterpret_cast<char*>(c.GetX(0));
         size_t len = static_cast<size_t>(c.GetX(1));
@@ -2324,9 +2974,30 @@ void BionicRuntime::RegisterAll() {
         c.SetW(0, 0);
     });
     fn("if_nametoindex", [](CpuContext& c) { c.SetW(0, 0); });
-    fn("inet_addr", [](CpuContext& c) { c.SetW(0, 0xFFFFFFFFu); });
-    fn("inet_pton", [](CpuContext& c) { c.SetW(0, 0); });
-    fn("inet_ntop", [](CpuContext& c) { c.SetX(0, 0); });
+    fn("inet_addr", [](CpuContext& c) {
+        const char* cp = reinterpret_cast<const char*>(c.GetX(0));
+        if (!cp) { c.SetW(0, 0xFFFFFFFFu); return; }
+        in_addr ia{};
+        if (::inet_pton(AF_INET, cp, &ia) == 1) {
+            c.SetW(0, ia.s_addr);
+        } else {
+            c.SetW(0, 0xFFFFFFFFu);
+        }
+    });
+    fn("inet_pton", [](CpuContext& c) {
+        int af = LinuxAfToWin(static_cast<int>(c.GetW(0)));
+        const char* src = reinterpret_cast<const char*>(c.GetX(1));
+        void* dst = reinterpret_cast<void*>(c.GetX(2));
+        c.SetW(0, static_cast<uint32_t>((src && dst) ? ::inet_pton(af, src, dst) : 0));
+    });
+    fn("inet_ntop", [](CpuContext& c) {
+        int af = LinuxAfToWin(static_cast<int>(c.GetW(0)));
+        const void* src = reinterpret_cast<const void*>(c.GetX(1));
+        char* dst = reinterpret_cast<char*>(c.GetX(2));
+        size_t sz = static_cast<size_t>(c.GetW(3));
+        const char* r = (src && dst) ? ::inet_ntop(af, src, dst, sz) : nullptr;
+        c.SetX(0, reinterpret_cast<uint64_t>(r));
+    });
 }
 
 void BionicRuntime::RegisterSdkStubs() {

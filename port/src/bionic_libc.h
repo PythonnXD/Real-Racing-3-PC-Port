@@ -63,6 +63,10 @@ public:
     // Set optional range [lo, hi) of libRealRacing3.so where menu usleep lives.
     void SetMenuUsleepRange(uint64_t lo, uint64_t hi) { menu_usleep_lo_ = lo; menu_usleep_hi_ = hi; }
 
+    // Enables or disables real Winsock2 POSIX socket bridging (false = strict offline mode).
+    void SetOnlineMode(bool enabled);
+    bool IsOnlineMode() const { return online_mode_; }
+
     // Access thread-local Bionic errno slot.
     static int* ThreadErrnoPtr();
 
@@ -72,6 +76,7 @@ private:
     LayeredVfs& vfs_;
     CustomDlResolverFn custom_dl_;
     bool skip_menu_usleep_ = false;
+    bool online_mode_ = false;
     uint64_t menu_usleep_lo_ = 0;
     uint64_t menu_usleep_hi_ = 0;
 };

@@ -1,7 +1,10 @@
 #include "java_firemint.h"
+#include "java_offline_stubs.h"
 
 #include <windows.h>
 #include <dwrite.h>
+#include <shellapi.h>
+#include <SDL.h>
 #include <GLES2/gl2.h>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -613,8 +616,66 @@ void FiremintRuntime::RegisterClasses() {
             return JniVal::Void();
         };
         d.methods["OnLegalOptOutChanged"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
-        d.methods["showKeyboardInput"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
-        d.methods["hideKeyboardInput"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
+        d.methods["showKeyboardInput"] = [this](FakeJvm& j, uint64_t, const auto& a) {
+            kb_ptr_ = a.size() > 0 ? a[0].AsLong() : 0;
+            kb_max_len_ = a.size() > 1 ? a[1].AsInt() : 0;
+            kb_uppercase_ = a.size() > 2 ? a[2].AsBool() : false;
+            kb_alnum_ = a.size() > 3 ? a[3].AsBool() : false;
+            kb_password_ = a.size() > 4 ? a[4].AsBool() : false;
+            kb_text_ = a.size() > 5 ? j.GetStringUtf(a[5].AsObj()) : "";
+            kb_is_cheat_ = false;
+            kb_active_ = true;
+            text_selected_all_ = false;
+            SDL_StartTextInput();
+            if (IsVerboseLogging()) {
+                std::fprintf(stdout, "[INPUT] showKeyboardInput(max=%d, upper=%d, alnum=%d, init='%s')\n",
+                             kb_max_len_, kb_uppercase_ ? 1 : 0, kb_alnum_ ? 1 : 0, kb_text_.c_str());
+            }
+            return JniVal::Void();
+        };
+        d.methods["hideKeyboardInput"] = [this](FakeJvm&, uint64_t, const auto&) {
+            kb_active_ = false;
+            if (!tf_active_) SDL_StopTextInput();
+            return JniVal::Void();
+        };
+        d.methods["isKeyboardInputShown"] = [this](FakeJvm&, uint64_t, const auto&) {
+            return JniVal::Bool(kb_active_);
+        };
+        d.methods["showCheatInput"] = [this](FakeJvm& j, uint64_t, const auto& a) {
+            kb_ptr_ = a.size() > 0 ? a[0].AsLong() : 0;
+            kb_text_ = a.size() > 1 ? j.GetStringUtf(a[1].AsObj()) : "";
+            kb_max_len_ = 256;
+            kb_uppercase_ = false;
+            kb_alnum_ = false;
+            kb_password_ = false;
+            kb_is_cheat_ = true;
+            kb_active_ = true;
+            SDL_StartTextInput();
+            return JniVal::Void();
+        };
+        d.methods["createTextField"] = [this](FakeJvm& j, uint64_t, const auto& a) {
+            int64_t cb_ptr = a.size() > 0 ? a[0].AsLong() : 0;
+            std::string init_txt = a.size() > 1 ? j.GetStringUtf(a[1].AsObj()) : "";
+            uint64_t tf = j.NewObjectInstance("com/firemint/realracing/TextField");
+            j.PinHandle(tf);
+            j.SetInstanceField(tf, "callbackptr", JniVal::Long(cb_ptr));
+            j.SetInstanceField(tf, "text", JniVal::Obj(j.NewStringUtf(init_txt)));
+            tf_handle_ = tf;
+            tf_ptr_ = cb_ptr;
+            tf_text_ = init_txt;
+            tf_active_ = true;
+            SDL_StartTextInput();
+            return JniVal::Obj(tf);
+        };
+        d.methods["removeTextField"] = [this](FakeJvm&, uint64_t, const auto& a) {
+            if (!a.empty() && a[0].AsObj() == tf_handle_) {
+                tf_active_ = false;
+                tf_handle_ = 0;
+                tf_ptr_ = 0;
+                if (!kb_active_) SDL_StopTextInput();
+            }
+            return JniVal::Void();
+        };
         d.methods["RunOnGlThread"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
         d.methods["runOnUiThread"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
 
@@ -674,7 +735,9 @@ void FiremintRuntime::RegisterClasses() {
         d.static_methods["getAppPath"] = [](FakeJvm& j, uint64_t, const auto&) { return JniVal::Obj(j.NewStringUtf("/storage/rr3/base.apk")); };
         d.static_methods["getOsVersion"] = [](FakeJvm& j, uint64_t, const auto&) { return JniVal::Obj(j.NewStringUtf("12")); };
         d.static_methods["GetDeviceHardware"] = [](FakeJvm& j, uint64_t, const auto&) { return JniVal::Obj(j.NewStringUtf("qcom")); };
-        d.static_methods["getDeviceUID"] = [](FakeJvm& j, uint64_t, const auto&) { return JniVal::Obj(j.NewStringUtf("rr3pc-offline-0001")); };
+        d.static_methods["getDeviceUID"] = [this](FakeJvm& j, uint64_t, const auto&) {
+            return JniVal::Obj(j.NewStringUtf(GetOrCreateDeviceUid(cfg_)));
+        };
         d.static_methods["getExternalStorageState"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Int(2); };
         d.static_methods["getExternalStorageDir"] = [](FakeJvm& j, uint64_t, const auto&) { return JniVal::Obj(j.NewStringUtf("/storage/rr3")); };
         d.static_methods["getLegacyExternalStorageDirPath"] = d.static_methods["getExternalStorageDir"];
@@ -686,7 +749,9 @@ void FiremintRuntime::RegisterClasses() {
         d.static_methods["getAssetManager"] = [this](FakeJvm&, uint64_t, const auto&) { return JniVal::Obj(asset_manager_handle_); };
         d.static_methods["getLocale"] = [](FakeJvm& j, uint64_t, const auto&) { return JniVal::Obj(j.NewStringUtf("en_US")); };
         d.static_methods["getCountry"] = [](FakeJvm& j, uint64_t, const auto&) { return JniVal::Obj(j.NewStringUtf("US")); };
-        d.static_methods["isNetworkAvailable"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Bool(false); };
+        d.static_methods["isNetworkAvailable"] = [this](FakeJvm&, uint64_t, const auto&) {
+            return JniVal::Bool(cfg_.online_mode);
+        };
         d.static_methods["isMobileDataAvailable"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Bool(false); };
         d.static_methods["getMobileDataType"] = [](FakeJvm& j, uint64_t, const auto&) { return JniVal::Obj(j.NewStringUtf("")); };
         d.static_methods["GetWifiSSID"] = [](FakeJvm& j, uint64_t, const auto&) { return JniVal::Obj(j.NewStringUtf("")); };
@@ -703,9 +768,23 @@ void FiremintRuntime::RegisterClasses() {
         d.static_methods["toggleIdleMode"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
         d.static_methods["memoryProbe"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
         d.static_methods["exitApp"] = [this](FakeJvm&, uint64_t, const auto&) { should_exit_ = true; return JniVal::Void(); };
-        d.static_methods["openURL"] = [](FakeJvm& j, uint64_t, const auto& a) {
-            if (IsVerboseLogging() && !a.empty()) {
-                std::fprintf(stdout, "[OFFLINE] Platform.openURL suppressed: %s\n", j.GetStringUtf(a[0].AsObj()).c_str());
+        d.static_methods["openURL"] = [this](FakeJvm& j, uint64_t, const auto& a) {
+            if (!a.empty()) {
+                std::string url = j.GetStringUtf(a[0].AsObj());
+                std::string low = url;
+                std::transform(low.begin(), low.end(), low.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (cfg_.online_mode && (low.rfind("https://", 0) == 0 || low.rfind("http://", 0) == 0)) {
+                    int wlen = MultiByteToWideChar(CP_UTF8, 0, url.c_str(), static_cast<int>(url.size()), nullptr, 0);
+                    if (wlen > 0) {
+                        std::wstring wurl(static_cast<size_t>(wlen), L'\0');
+                        MultiByteToWideChar(CP_UTF8, 0, url.c_str(), static_cast<int>(url.size()), wurl.data(), wlen);
+                        std::fprintf(stdout, "[ONLINE] Platform.openURL -> %s\n", url.c_str());
+                        ShellExecuteW(nullptr, L"open", wurl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    }
+                } else if (IsVerboseLogging()) {
+                    std::fprintf(stdout, "[OFFLINE] Platform.openURL suppressed: %s\n", url.c_str());
+                }
             }
             return JniVal::Void();
         };
@@ -718,7 +797,13 @@ void FiremintRuntime::RegisterClasses() {
         d.static_methods["requestExactNotifications"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
         d.static_methods["extractRes"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Bool(true); };
         d.static_methods["deleteDirectory"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Bool(true); };
-        d.static_methods["SetClipboardText"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
+        d.static_methods["SetClipboardText"] = [](FakeJvm& j, uint64_t, const auto& a) {
+            if (!a.empty()) {
+                std::string s = j.GetStringUtf(a[0].AsObj());
+                SDL_SetClipboardText(s.c_str());
+            }
+            return JniVal::Void();
+        };
         d.static_methods["showMessage"] = [this](FakeJvm& j, uint64_t, const auto& a) {
             std::string title = a.size() > 0 ? j.GetStringUtf(a[0].AsObj()) : "";
             std::string body = a.size() > 1 ? j.GetStringUtf(a[1].AsObj()) : "";
@@ -1330,8 +1415,162 @@ void FiremintRuntime::RegisterClasses() {
     {
         JniClassDef d;
         d.name = "com/firemint/realracing/TextField";
-        d.methods["show"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
-        d.methods["hide"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
+        d.methods["show"] = [this](FakeJvm&, uint64_t self, const auto&) {
+            tf_handle_ = self;
+            tf_active_ = true;
+            SDL_StartTextInput();
+            return JniVal::Void();
+        };
+        d.methods["hide"] = [this](FakeJvm&, uint64_t, const auto&) {
+            tf_active_ = false;
+            if (!kb_active_) SDL_StopTextInput();
+            return JniVal::Void();
+        };
+        d.methods["setText"] = [this](FakeJvm& j, uint64_t self, const auto& a) {
+            if (!a.empty()) {
+                std::string t = j.GetStringUtf(a[0].AsObj());
+                j.SetInstanceField(self, "text", a[0]);
+                if (self == tf_handle_) tf_text_ = t;
+            }
+            return JniVal::Void();
+        };
+        d.methods["setHint"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
+        d.methods["setVisible"] = [this](FakeJvm&, uint64_t self, const auto& a) {
+            bool vis = !a.empty() && a[0].AsBool();
+            if (self == tf_handle_) {
+                tf_active_ = vis;
+                if (vis) SDL_StartTextInput();
+                else if (!kb_active_) SDL_StopTextInput();
+            }
+            return JniVal::Void();
+        };
+        d.methods["setEnabled"] = [this](FakeJvm&, uint64_t self, const auto& a) {
+            bool en = !a.empty() && a[0].AsBool();
+            if (self == tf_handle_) {
+                tf_active_ = en;
+                if (en) SDL_StartTextInput();
+                else if (!kb_active_) SDL_StopTextInput();
+            }
+            return JniVal::Void();
+        };
+        d.methods["setTextColor"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
+        d.methods["setBackgroundColor"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
+        d.methods["setBounds"] = [](FakeJvm&, uint64_t, const auto&) { return JniVal::Void(); };
         jvm_.RegisterJniClass(std::move(d));
+    }
+}
+
+void FiremintRuntime::FilterAndDispatchTextUpdate() {
+    if (kb_active_) {
+        std::string filtered;
+        filtered.reserve(kb_text_.size());
+        for (unsigned char c : kb_text_) {
+            if (kb_alnum_) {
+                if (!std::isalnum(c)) continue;
+            } else if (kb_password_) {
+                if (!std::isalnum(c) && !std::isspace(c)) continue;
+            }
+            if (kb_uppercase_ && c < 128) c = static_cast<unsigned char>(std::toupper(c));
+            filtered.push_back(static_cast<char>(c));
+        }
+        if (kb_max_len_ > 0 && static_cast<int>(filtered.size()) > kb_max_len_) {
+            filtered.resize(static_cast<size_t>(kb_max_len_));
+        }
+        kb_text_ = std::move(filtered);
+        if (!kb_is_cheat_) {
+            uint64_t fn = loader_.FindExport("Java_com_firemint_realracing_MainActivity_onKeyboardInputUpdate");
+            if (fn && kb_ptr_) {
+                uint64_t jstr = jvm_.NewStringUtf(kb_text_);
+                cpu_.CallGuest(fn, {jvm_.GetJniEnvGuestPtr(), main_activity_handle_, jstr, static_cast<uint64_t>(kb_ptr_)});
+            }
+        }
+        return;
+    }
+    if (tf_active_ && tf_handle_ && tf_ptr_) {
+        uint64_t fn = loader_.FindExport("Java_com_firemint_realracing_TextField_onTextInputChanged");
+        if (fn) {
+            uint64_t jstr = jvm_.NewStringUtf(tf_text_);
+            uint64_t ret = cpu_.CallGuest(fn, {jvm_.GetJniEnvGuestPtr(), tf_handle_, jstr, static_cast<uint64_t>(tf_ptr_)});
+            if (ret) tf_text_ = jvm_.GetStringUtf(ret);
+        }
+    }
+}
+
+void FiremintRuntime::FinishTextInput(bool /*cancelled*/) {
+    if (kb_active_) {
+        kb_active_ = false;
+        if (!tf_active_) SDL_StopTextInput();
+        const char* sym = kb_is_cheat_
+                              ? "Java_com_firemint_realracing_MainActivity_onCheatInputDone"
+                              : "Java_com_firemint_realracing_MainActivity_onKeyboardInputDone";
+        uint64_t fn = loader_.FindExport(sym);
+        if (fn && kb_ptr_) {
+            uint64_t jstr = jvm_.NewStringUtf(kb_text_);
+            cpu_.CallGuest(fn, {jvm_.GetJniEnvGuestPtr(), main_activity_handle_, jstr, static_cast<uint64_t>(kb_ptr_)});
+        }
+        return;
+    }
+    if (tf_active_) {
+        tf_active_ = false;
+        SDL_StopTextInput();
+    }
+}
+
+void FiremintRuntime::OnTextInput(const char* utf8_text) {
+    if (!utf8_text || !*utf8_text || !IsTextInputActive()) return;
+    std::string& buf = kb_active_ ? kb_text_ : tf_text_;
+    if (text_selected_all_) {
+        buf.clear();
+        text_selected_all_ = false;
+    }
+    buf += utf8_text;
+    FilterAndDispatchTextUpdate();
+}
+
+void FiremintRuntime::OnTextKeyDown(int32_t sdl_keycode, uint16_t sdl_mod) {
+    if (!IsTextInputActive()) return;
+    std::string& buf = kb_active_ ? kb_text_ : tf_text_;
+    const bool ctrl = (sdl_mod & KMOD_CTRL) != 0;
+
+    if (ctrl && sdl_keycode == SDLK_a) {
+        text_selected_all_ = true;
+    } else if (sdl_keycode == SDLK_BACKSPACE || sdl_keycode == SDLK_DELETE) {
+        if (ctrl || text_selected_all_) {
+            buf.clear();
+            text_selected_all_ = false;
+        } else if (sdl_keycode == SDLK_BACKSPACE && !buf.empty()) {
+            // Pop one UTF-8 codepoint
+            while (!buf.empty() && (static_cast<unsigned char>(buf.back()) & 0xC0) == 0x80) {
+                buf.pop_back();
+            }
+            if (!buf.empty()) buf.pop_back();
+        }
+        FilterAndDispatchTextUpdate();
+    } else if (ctrl && sdl_keycode == SDLK_v) {
+        if (char* clip = SDL_GetClipboardText()) {
+            if (text_selected_all_) {
+                buf.clear();
+                text_selected_all_ = false;
+            }
+            for (const char* p = clip; *p; ++p) {
+                if (*p != '\r' && *p != '\n') buf.push_back(*p);
+            }
+            SDL_free(clip);
+            FilterAndDispatchTextUpdate();
+        }
+    } else if (ctrl && sdl_keycode == SDLK_c) {
+        SDL_SetClipboardText(buf.c_str());
+    } else if (sdl_keycode == SDLK_RETURN || sdl_keycode == SDLK_KP_ENTER) {
+        text_selected_all_ = false;
+        FinishTextInput(false);
+    } else if (sdl_keycode == SDLK_ESCAPE) {
+        text_selected_all_ = false;
+        FinishTextInput(true);
+    }
+}
+
+void FiremintRuntime::OnTextBlurOrDismiss() {
+    if (IsTextInputActive()) {
+        FinishTextInput(true);
     }
 }

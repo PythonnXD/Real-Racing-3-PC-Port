@@ -629,15 +629,26 @@ void TestConfigQualityVerboseAndDistTools() {
             CHECK(!fs::exists(stage / "rr3_pc.ini", ec)); // user's existing INI must NOT be overwritten!
         }
 
-        // Config round-trip for updater flags
+        // Config round-trip for updater & online_mode flags
         PcConfig uc;
         uc.auto_check_updates = true;
         uc.auto_install_updates = true;
         uc.skipped_update_version = "1.1.0";
+        uc.online_mode = true;
         const fs::path uini = tmp / "upd_cfg.ini";
         CHECK(SaveConfig(uini, uc));
         PcConfig uc2 = LoadConfig(uini);
-        CHECK(uc2.auto_check_updates && uc2.auto_install_updates && uc2.skipped_update_version == "1.1.0");
+        CHECK(uc2.auto_check_updates && uc2.auto_install_updates &&
+              uc2.skipped_update_version == "1.1.0" && uc2.online_mode);
+
+        // Verify patched Project Resurrection APK (rr3-b62.apk) is recognized as compatible v14.0.1!
+        const fs::path prr_apk = R"(d:\Real Racing 3\rr3-b62.apk)";
+        if (fs::is_regular_file(prr_apk, ec)) {
+            const fs::path prr_dir = tmp / "prr_libs";
+            std::string pmsg;
+            CHECK(ExtractArm64LibsFromApk(prr_apk, prr_dir, pmsg));
+            CHECK(IsCompatibleRr3_14_0_1So(prr_dir / "libRealRacing3.so"));
+        }
     }
 
     fs::remove_all(tmp, ec);

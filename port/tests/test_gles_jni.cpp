@@ -2,7 +2,9 @@
 #include "cpu_dynarmic.h"
 #include "elf_loader.h"
 #include "gles_bridge.h"
+#include "java_firemint.h"
 #include "jni_env.h"
+#include "vfs.h"
 
 #include <SDL.h>
 #include <SDL_syswm.h>
@@ -360,6 +362,83 @@ void test_multi_gpu_extensions_and_decoders() {
     std::printf("  [PASS] test_multi_gpu_extensions_and_decoders (ATC/ETC1/DXT/PVRTC ext curation + DXT1/3/5 & PVRTC1 4bpp/2bpp decoders)\n");
 }
 
+void test_keyboard_text_input() {
+    CpuRuntime cpu;
+    ElfLoader loader(cpu);
+    GlesBridge gles(cpu);
+    FakeJvm jvm(cpu);
+    LayeredVfs vfs;
+    PcConfig cfg{};
+    FiremintRuntime firemint(cpu, loader, gles, jvm, vfs, cfg);
+    firemint.RegisterClasses();
+
+    // Register host callbacks standing in for libRealRacing3.so JNI native exports
+    std::string last_update, last_done, last_tf;
+    int64_t last_ptr = 0;
+    loader.RegisterHostFunction("Java_com_firemint_realracing_MainActivity_onKeyboardInputUpdate",
+                                [&](CpuContext& c) {
+                                    last_update = jvm.GetStringUtf(c.GetX(2));
+                                    last_ptr = static_cast<int64_t>(c.GetX(3));
+                                });
+    loader.RegisterHostFunction("Java_com_firemint_realracing_MainActivity_onKeyboardInputDone",
+                                [&](CpuContext& c) {
+                                    last_done = jvm.GetStringUtf(c.GetX(2));
+                                    last_ptr = static_cast<int64_t>(c.GetX(3));
+                                });
+    loader.RegisterHostFunction("Java_com_firemint_realracing_TextField_onTextInputChanged",
+                                [&](CpuContext& c) {
+                                    last_tf = jvm.GetStringUtf(c.GetX(2));
+                                    last_ptr = static_cast<int64_t>(c.GetX(3));
+                                    c.SetX(0, c.GetX(2));
+                                });
+
+    // Invoke MainActivity.showKeyboardInput(ptr=0x1234, maxLen=8, uppercase=true, alnum=true, password=false, init="ab")
+    uint64_t act = firemint.MainActivityHandle();
+    auto* cls = jvm.FindClassDef("com/firemint/realracing/MainActivity");
+    CHECK(cls != nullptr);
+    auto it_show = cls->methods.find("showKeyboardInput");
+    auto it_shown = cls->methods.find("isKeyboardInputShown");
+    auto it_tf = cls->methods.find("createTextField");
+    auto it_rm_tf = cls->methods.find("removeTextField");
+    CHECK(it_show != cls->methods.end() && it_shown != cls->methods.end() && it_tf != cls->methods.end());
+
+    CHECK(!firemint.IsTextInputActive());
+    it_show->second(jvm, act, {
+        JniVal::Long(0x1234), JniVal::Int(8), JniVal::Bool(true),
+        JniVal::Bool(true), JniVal::Bool(false), JniVal::Obj(jvm.NewStringUtf("ab"))
+    });
+    CHECK(firemint.IsTextInputActive());
+    CHECK(it_shown->second(jvm, act, {}).AsBool());
+
+    // Type mixed symbols/spaces/digits -> alnum filter + uppercase + clamp to 8 chars
+    firemint.OnTextInput("c!d 123456");
+    CHECK(last_update == "ABCD1234" && last_ptr == 0x1234);
+
+    // Backspace deletes one character
+    firemint.OnTextKeyDown(SDLK_BACKSPACE, 0);
+    CHECK(last_update == "ABCD123");
+
+    // Ctrl+A then type replaces entire buffer
+    firemint.OnTextKeyDown(SDLK_a, KMOD_CTRL);
+    firemint.OnTextInput("prr99");
+    CHECK(last_update == "PRR99");
+
+    // Enter finishes and fires onKeyboardInputDone
+    firemint.OnTextKeyDown(SDLK_RETURN, 0);
+    CHECK(!firemint.IsTextInputActive());
+    CHECK(last_done == "PRR99" && last_ptr == 0x1234);
+
+    // TextField path: createTextField -> OnTextInput -> onTextInputChanged -> removeTextField
+    uint64_t tf = it_tf->second(jvm, act, {JniVal::Long(0x5678), JniVal::Obj(jvm.NewStringUtf("hello"))}).AsObj();
+    CHECK(tf != 0 && firemint.IsTextInputActive());
+    firemint.OnTextInput(" world");
+    CHECK(last_tf == "hello world" && last_ptr == 0x5678);
+    it_rm_tf->second(jvm, act, {JniVal::Obj(tf)});
+    CHECK(!firemint.IsTextInputActive());
+
+    std::printf("  [PASS] test_keyboard_text_input (showKeyboardInput/alnum/upper/maxLen/Backspace/Ctrl+A/Enter + TextField)\n");
+}
+
 } // namespace
 
 int main() {
@@ -368,6 +447,7 @@ int main() {
     test_angle_and_guest_gl();
     test_fake_jvm_roundtrip();
     test_multi_gpu_extensions_and_decoders();
+    test_keyboard_text_input();
     std::printf("test_gles_jni ALL PASSED\n");
     return 0;
 }

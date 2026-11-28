@@ -62,6 +62,9 @@ copy /y "d:\Real Racing 3\port\README_DIST.txt" "%STAGE_DIR%\README.txt" >nul
     echo [updates]
     echo auto_check_updates=true
     echo auto_install_updates=false
+    echo.
+    echo [network]
+    echo online_mode=false
 )
 
 powershell -NoProfile -Command "Compress-Archive -Path '%STAGE_DIR%\*' -DestinationPath '%ZIP_PATH%' -Force"

@@ -544,6 +544,70 @@ std::string ComputeFileSha256Hex(const std::filesystem::path& path) {
     return out;
 }
 
+bool IsCompatibleRr3_14_0_1So(const std::filesystem::path& so_path) {
+    std::ifstream in(so_path, std::ios::binary | std::ios::ate);
+    if (!in.is_open()) return false;
+    const int64_t fsz = static_cast<int64_t>(in.tellg());
+    if (fsz < 0x1300000) return false;
+
+    uint8_t ehdr[64]{};
+    in.seekg(0, std::ios::beg);
+    in.read(reinterpret_cast<char*>(ehdr), sizeof(ehdr));
+    if (!in.good() || ehdr[0] != 0x7F || ehdr[1] != 'E' || ehdr[2] != 'L' || ehdr[3] != 'F' || ehdr[4] != 2) {
+        return false;
+    }
+    uint64_t e_phoff = 0;
+    std::memcpy(&e_phoff, ehdr + 32, 8);
+    const uint16_t e_phentsize = ReadLe16(ehdr + 54);
+    const uint16_t e_phnum = ReadLe16(ehdr + 56);
+    if (e_phentsize < 56 || e_phnum == 0 || e_phnum > 64) return false;
+
+    struct LoadSeg { uint64_t vstart, vend, foff; };
+    std::vector<LoadSeg> segs;
+    for (uint16_t i = 0; i < e_phnum; ++i) {
+        uint8_t ph[56]{};
+        in.seekg(static_cast<std::streamoff>(e_phoff + static_cast<uint64_t>(i) * e_phentsize), std::ios::beg);
+        in.read(reinterpret_cast<char*>(ph), sizeof(ph));
+        if (!in.good()) return false;
+        if (ReadLe32(ph) == 1u) { // PT_LOAD
+            uint64_t p_off = 0, p_va = 0, p_fsz = 0;
+            std::memcpy(&p_off, ph + 8, 8);
+            std::memcpy(&p_va, ph + 16, 8);
+            std::memcpy(&p_fsz, ph + 32, 8);
+            segs.push_back({p_va, p_va + p_fsz, p_off});
+        }
+    }
+
+    auto read_va_u32 = [&](uint64_t va, uint32_t& out) -> bool {
+        for (const auto& s : segs) {
+            if (va >= s.vstart && va + 4 <= s.vend) {
+                uint64_t fo = s.foff + (va - s.vstart);
+                if (static_cast<int64_t>(fo + 4) > fsz) return false;
+                uint8_t buf[4]{};
+                in.seekg(static_cast<std::streamoff>(fo), std::ios::beg);
+                in.read(reinterpret_cast<char*>(buf), 4);
+                if (!in.good()) return false;
+                out = ReadLe32(buf);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    static constexpr std::pair<uint64_t, uint32_t> kExpectedInsns[] = {
+        {0x0df981cULL, 0x7100041fu}, // cmp w0, #1 (gamepad cursor)
+        {0x12ae40cULL, 0xb50017a8u}, // cbnz x8, ... (live resize)
+        {0x12ad664ULL, 0x2a0003e1u}, // mov w1, w0 (quality tier caller 1)
+        {0x12adbd4ULL, 0x2a0003e1u}, // mov w1, w0 (quality tier caller 2)
+        {0x12af0d0ULL, 0x52800a49u}, // menu usleep anchor
+    };
+    for (const auto& [va, expect] : kExpectedInsns) {
+        uint32_t got = 0;
+        if (!read_va_u32(va, got) || got != expect) return false;
+    }
+    return true;
+}
+
 GameDataStatus CheckGameDataStatus(const PcConfig& cfg) {
     GameDataStatus st;
     std::error_code ec;
@@ -558,6 +622,7 @@ GameDataStatus CheckGameDataStatus(const PcConfig& cfg) {
     if (st.has_libs) {
         st.rr3_sha256 = ComputeFileSha256Hex(p_rr3);
         st.hash_matches = (st.rr3_sha256 == kExpectedRr3SoSha256);
+        st.is_patched_14_0_1 = !st.hash_matches && IsCompatibleRr3_14_0_1So(p_rr3);
     }
 
     const std::filesystem::path ro(cfg.readonly_files_dir);
@@ -572,10 +637,11 @@ GameDataStatus CheckGameDataStatus(const PcConfig& cfg) {
     st.has_save_data = (st.save_file_count > 0);
 
     std::ostringstream oss;
-    if (st.has_libs && st.hash_matches && st.has_depot) {
-        oss << "Ready to play (RR3 v14.0.1 ARM64 verified · "
-            << DepotGpuFormatToString(st.depot_profile.gpu_format) << " · UI "
-            << DepotGuiTierToDirName(st.depot_profile.gui_tier) << ")";
+    if (st.has_libs && (st.hash_matches || st.is_patched_14_0_1) && st.has_depot) {
+        oss << "Ready to play (RR3 v14.0.1"
+            << (st.is_patched_14_0_1 ? " modded" : "")
+            << " · " << DepotGpuFormatToString(st.depot_profile.gpu_format)
+            << " · UI " << DepotGuiTierToDirName(st.depot_profile.gui_tier) << ")";
     } else if (!st.has_libs && !st.has_depot) {
         oss << "Setup required: select your Real Racing 3 APK to extract libraries and select com.ea.games.r3_row data folder.";
     } else if (!st.has_libs) {
@@ -745,6 +811,9 @@ bool ExtractArm64LibsFromApk(const std::filesystem::path& apk_path,
     if (sha == kExpectedRr3SoSha256) {
         out_status = "Extracted " + std::to_string(extracted.size()) +
                      " ARM64 libraries. Verified RR3 v14.0.1 SHA-256 (" + sha.substr(0, 12) + "...).";
+    } else if (IsCompatibleRr3_14_0_1So(out_arm64_dir / "libRealRacing3.so")) {
+        out_status = "Extracted " + std::to_string(extracted.size()) +
+                     " ARM64 libraries. Detected compatible patched RR3 v14.0.1 build (" + sha.substr(0, 12) + "...).";
     } else {
         out_status = "Extracted " + std::to_string(extracted.size()) +
                      " ARM64 libraries, but libRealRacing3.so SHA-256 (" + sha.substr(0, 12) +

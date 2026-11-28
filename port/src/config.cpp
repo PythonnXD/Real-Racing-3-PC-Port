@@ -354,6 +354,7 @@ PcConfig LoadConfig(const std::filesystem::path& path) {
             else if (key == "auto_check_updates") cfg.auto_check_updates = ParseBool(val);
             else if (key == "auto_install_updates") cfg.auto_install_updates = ParseBool(val);
             else if (key == "skipped_update_version") cfg.skipped_update_version = val;
+            else if (key == "online_mode") cfg.online_mode = ParseBool(val);
         } catch (const std::exception&) {
             // Keep default value on malformed numeric INI entry
         }
@@ -420,6 +421,9 @@ bool SaveConfig(const std::filesystem::path& path, const PcConfig& cfg) {
     if (!cfg.skipped_update_version.empty()) {
         out << "skipped_update_version=" << cfg.skipped_update_version << "\n";
     }
+    out << "\n[network]\n"
+        << "# online_mode: true enables Cloudcell HTTP and sockets (needed for Project Resurrection online)\n"
+        << "online_mode=" << (cfg.online_mode ? "true" : "false") << "\n";
 
     if (!cfg.apk_path.empty() || !cfg.readonly_files_dir.empty() ||
         !cfg.userdata_dir.empty() || !cfg.work_bins_dir.empty()) {

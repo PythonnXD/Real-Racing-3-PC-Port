@@ -351,6 +351,95 @@ void TestVfsGuiTierFallbackAndMkdir() {
     std::printf("  [PASS] test_vfs_gui_tier_fallback_and_mkdir\n");
 }
 
+void TestOnlineWinsockLoopbackAndOfflineBlock() {
+    auto tmp_ro = std::filesystem::temp_directory_path() / "rr3_test_net_ro";
+    auto tmp_ud = std::filesystem::temp_directory_path() / "rr3_test_net_ud";
+    std::filesystem::remove_all(tmp_ro);
+    std::filesystem::remove_all(tmp_ud);
+    std::filesystem::create_directories(tmp_ro);
+
+    LayeredVfs vfs;
+    vfs.Initialize(tmp_ro, tmp_ud);
+
+    CpuRuntime cpu;
+    ElfLoader loader(cpu);
+    BionicRuntime bionic(cpu, loader, vfs);
+    bionic.RegisterAll();
+
+    uint64_t fn_socket = loader.FindHostSymbol("socket");
+    uint64_t fn_bind = loader.FindHostSymbol("bind");
+    uint64_t fn_listen = loader.FindHostSymbol("listen");
+    uint64_t fn_getsockname = loader.FindHostSymbol("getsockname");
+    uint64_t fn_connect = loader.FindHostSymbol("connect");
+    uint64_t fn_accept = loader.FindHostSymbol("accept");
+    uint64_t fn_send = loader.FindHostSymbol("send");
+    uint64_t fn_recv = loader.FindHostSymbol("recv");
+    uint64_t fn_close = loader.FindHostSymbol("close");
+    uint64_t fn_inet_pton = loader.FindHostSymbol("inet_pton");
+    CHECK(fn_socket && fn_bind && fn_listen && fn_connect && fn_accept && fn_send && fn_recv && fn_close);
+
+    // Offline default: socket() MUST fail with -1
+    CHECK(static_cast<int64_t>(cpu.CallGuest(fn_socket, {2, 1, 0})) == -1LL);
+
+    // Online mode: real TCP loopback roundtrip over virtual socket FDs (512..1023 so FD_SET/select fit)
+    bionic.SetOnlineMode(true);
+    int srv = static_cast<int>(cpu.CallGuest(fn_socket, {2, 1, 0})); // AF_INET, SOCK_STREAM
+    CHECK(srv >= 512 && srv < 1024);
+
+    // Verify Bionic AArch64 struct addrinfo layout (ai_canonname=+24, ai_addr=+32, ai_next=+40)
+    auto fn_getaddrinfo = loader.FindHostSymbol("getaddrinfo");
+    auto fn_freeaddrinfo = loader.FindHostSymbol("freeaddrinfo");
+    CHECK(fn_getaddrinfo && fn_freeaddrinfo);
+    uint64_t ai_res = 0;
+    const char* lo_host = "127.0.0.1";
+    const char* lo_svc = "8080";
+    CHECK(static_cast<int>(cpu.CallGuest(fn_getaddrinfo, {
+              reinterpret_cast<uint64_t>(lo_host), reinterpret_cast<uint64_t>(lo_svc),
+              0, reinterpret_cast<uint64_t>(&ai_res)})) == 0);
+    CHECK(ai_res != 0);
+    const auto* ai_bytes = reinterpret_cast<const uint8_t*>(ai_res);
+    uint32_t ai_addrlen = 0;
+    uint64_t ai_addr_ptr = 0;
+    std::memcpy(&ai_addrlen, ai_bytes + 16, 4);
+    std::memcpy(&ai_addr_ptr, ai_bytes + 32, 8);
+    CHECK(ai_addrlen >= 16 && ai_addr_ptr != 0);
+    uint16_t sa_fam = 0;
+    std::memcpy(&sa_fam, reinterpret_cast<const void*>(ai_addr_ptr), 2);
+    CHECK(sa_fam == 2); // AF_INET
+    cpu.CallGuest(fn_freeaddrinfo, {ai_res});
+
+    uint8_t sa[16]{};
+    sa[0] = 2; // AF_INET
+    const char* lo_ip = "127.0.0.1";
+    CHECK(static_cast<int>(cpu.CallGuest(fn_inet_pton, {2, reinterpret_cast<uint64_t>(lo_ip), reinterpret_cast<uint64_t>(sa + 4)})) == 1);
+    CHECK(static_cast<int>(cpu.CallGuest(fn_bind, {static_cast<uint64_t>(srv), reinterpret_cast<uint64_t>(sa), 16})) == 0);
+    CHECK(static_cast<int>(cpu.CallGuest(fn_listen, {static_cast<uint64_t>(srv), 2})) == 0);
+
+    uint8_t bound_sa[16]{};
+    uint32_t bound_len = 16;
+    CHECK(static_cast<int>(cpu.CallGuest(fn_getsockname, {static_cast<uint64_t>(srv), reinterpret_cast<uint64_t>(bound_sa), reinterpret_cast<uint64_t>(&bound_len)})) == 0);
+
+    int cli = static_cast<int>(cpu.CallGuest(fn_socket, {2, 1, 0}));
+    CHECK(cli >= 512 && cli < 1024 && cli != srv);
+    CHECK(static_cast<int>(cpu.CallGuest(fn_connect, {static_cast<uint64_t>(cli), reinterpret_cast<uint64_t>(bound_sa), 16})) == 0);
+    int acc = static_cast<int>(cpu.CallGuest(fn_accept, {static_cast<uint64_t>(srv), 0, 0}));
+    CHECK(acc >= 512 && acc < 1024);
+
+    const char* msg = "PRR_ONLINE_OK";
+    CHECK(static_cast<int64_t>(cpu.CallGuest(fn_send, {static_cast<uint64_t>(cli), reinterpret_cast<uint64_t>(msg), 13, 0})) == 13);
+    char rbuf[32]{};
+    CHECK(static_cast<int64_t>(cpu.CallGuest(fn_recv, {static_cast<uint64_t>(acc), reinterpret_cast<uint64_t>(rbuf), sizeof(rbuf), 0})) == 13);
+    CHECK(std::strcmp(rbuf, "PRR_ONLINE_OK") == 0);
+
+    CHECK(static_cast<int>(cpu.CallGuest(fn_close, {static_cast<uint64_t>(acc)})) == 0);
+    CHECK(static_cast<int>(cpu.CallGuest(fn_close, {static_cast<uint64_t>(cli)})) == 0);
+    CHECK(static_cast<int>(cpu.CallGuest(fn_close, {static_cast<uint64_t>(srv)})) == 0);
+
+    std::filesystem::remove_all(tmp_ro);
+    std::filesystem::remove_all(tmp_ud);
+    std::printf("  [PASS] test_online_winsock_loopback_and_offline_block\n");
+}
+
 } // namespace
 
 int main() {
@@ -359,6 +448,7 @@ int main() {
     TestPthreadAndEmutls();
     TestAarch64StringMemStubsAndMergedDir();
     TestVfsGuiTierFallbackAndMkdir();
+    TestOnlineWinsockLoopbackAndOfflineBlock();
     TestRr3InitArrays();
     std::printf("test_bionic_vfs ALL PASSED\n");
     return 0;

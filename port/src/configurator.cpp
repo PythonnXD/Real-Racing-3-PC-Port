@@ -148,6 +148,7 @@ enum class HitKind {
     ToggleVsync,
     ToggleMenuFps,
     ToggleVerbose,
+    ToggleOnlineMode,
     KeyBind,
     BtnResetKeys,
     BtnBrowseApk,
@@ -1151,6 +1152,7 @@ public:
     SpringState sp_vsync;
     SpringState sp_menu_fps;
     SpringState sp_verbose;
+    SpringState sp_online_mode;
     SpringState sp_auto_update;
     SpringState sp_press;
     bool anim_timer_on = false;
@@ -1207,6 +1209,7 @@ public:
         sp_vsync.Snap(cfg.vsync ? 1.0f : 0.0f);
         sp_menu_fps.Snap(cfg.unlock_menu_fps ? 1.0f : 0.0f);
         sp_verbose.Snap(cfg.verbose_logs ? 1.0f : 0.0f);
+        sp_online_mode.Snap(cfg.online_mode ? 1.0f : 0.0f);
         sp_auto_update.Snap(cfg.auto_install_updates ? 1.0f : 0.0f);
         sp_press.Snap(1.0f);
     }
@@ -1225,6 +1228,7 @@ public:
         moving |= sp_vsync.Step(dt, 0.18f);
         moving |= sp_menu_fps.Step(dt, 0.18f);
         moving |= sp_verbose.Step(dt, 0.18f);
+        moving |= sp_online_mode.Step(dt, 0.18f);
         moving |= sp_auto_update.Step(dt, 0.18f);
         moving |= sp_press.Step(dt, 0.14f);
 
@@ -1845,10 +1849,14 @@ public:
             draw_txt(kContentX + 16, 172, 240, 52, L"Anisotropic filtering", f_body, br_text);
             DrawDropdownButton(g, f_body, kContentX + 372, 182, 140, 32, kAnisoChoices[aniso_idx].label, HitKind::DropAniso);
 
-            // Group 2: Verbose logs (clean, zero diagnostic subtitle as requested)
-            DrawGroupedContainer(g, kContentX, 240, kContentW, 52);
+            // Group 2: Verbose logs + Online mode (2 rows: y=240..356)
+            DrawGroupedContainer(g, kContentX, 240, kContentW, 112, {292});
             draw_txt(kContentX + 16, 240, 240, 52, L"Verbose logs", f_body, br_text);
             DrawToggleSwitch(g, kContentX + kContentW - 60, 254, sp_verbose.val, HitKind::ToggleVerbose);
+
+            draw_txt(kContentX + 16, 300, 260, 20, L"Online mode", f_body, br_text);
+            draw_txt(kContentX + 16, 322, 430, 18, L"Allow internet access for private servers (Project Resurrection)", f_sub, br_mut);
+            DrawToggleSwitch(g, kContentX + kContentW - 60, 310, sp_online_mode.val, HitKind::ToggleOnlineMode);
         } else if (active_tab == 2) {
             // Section: Keyboard
             draw_txt(kContentX, 64, 200, 20, L"Keyboard", f_sub_semi, br_sec);
@@ -2068,6 +2076,13 @@ public:
                 SetToast(L"Unsaved changes");
                 StartAnimTimer();
                 break;
+            case HitKind::ToggleOnlineMode:
+                cfg.online_mode = !cfg.online_mode;
+                sp_online_mode.target = cfg.online_mode ? 1.0f : 0.0f;
+                dirty = true;
+                SetToast(L"Unsaved changes");
+                StartAnimTimer();
+                break;
             case HitKind::KeyBind:
                 listening_key_slot = (listening_key_slot == idx) ? -1 : idx;
                 SetToast(listening_key_slot >= 0 ? L"Press a key to bind" : L"", kColAmber);
@@ -2120,6 +2135,11 @@ public:
                 }
                 data_status = CheckGameDataStatus(cfg);
                 if (ok) {
+                    if (data_status.is_patched_14_0_1 && !cfg.online_mode) {
+                        cfg.online_mode = true;
+                        sp_online_mode.target = 1.0f;
+                        st += "\nOnline mode enabled automatically for patched build.";
+                    }
                     SaveConfig(config_path, cfg);
                     SetToast(L"Libraries verified", kColGreen);
                     MessageBoxW(hwnd, Utf8ToWide(st).c_str(), L"Extraction complete", MB_OK | MB_ICONINFORMATION);
@@ -2218,6 +2238,7 @@ public:
                 sp_vsync.target = cfg.vsync ? 1.0f : 0.0f;
                 sp_menu_fps.target = cfg.unlock_menu_fps ? 1.0f : 0.0f;
                 sp_verbose.target = cfg.verbose_logs ? 1.0f : 0.0f;
+                sp_online_mode.target = cfg.online_mode ? 1.0f : 0.0f;
                 sp_auto_update.target = cfg.auto_install_updates ? 1.0f : 0.0f;
                 dirty = true;
                 UpdateTabVisibility();

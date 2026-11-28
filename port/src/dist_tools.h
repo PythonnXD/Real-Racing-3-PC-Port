@@ -56,6 +56,7 @@ bool EnsureApkResExtracted(const std::filesystem::path& apk_path,
 struct GameDataStatus {
     bool has_libs = false;
     bool hash_matches = false;
+    bool is_patched_14_0_1 = false;
     bool has_depot = false;
     bool has_save_data = false;
     size_t save_file_count = 0;
@@ -63,6 +64,10 @@ struct GameDataStatus {
     std::string rr3_sha256;
     std::string summary;
 };
+
+// Returns true if path is a stock OR binary-patched RR3 v14.0.1 libRealRacing3.so
+// (matching exact v14.0.1 ELF layout and all 5 PC patch instruction signatures, e.g. Project Resurrection).
+bool IsCompatibleRr3_14_0_1So(const std::filesystem::path& so_path);
 
 // Computes lowercase hex SHA-256 of a file using Windows BCrypt. Returns empty string on error.
 std::string ComputeFileSha256Hex(const std::filesystem::path& path);

@@ -103,6 +103,7 @@ target_include_directories(rr3_bionic PUBLIC src)
 target_link_libraries(rr3_bionic PUBLIC
     rr3_core
     rr3_config_lib
+    ws2_32
 )
 
 # ---- ANGLE GLES2 Bridge + Fake JNI library ----
@@ -150,11 +151,25 @@ target_link_libraries(test_bionic_vfs PRIVATE
     rr3_gles_jni
 )
 
-# ---- Task 4 ANGLE GLES2 + Fake JNI Test ----
-add_executable(test_gles_jni tests/test_gles_jni.cpp)
+# ---- Task 4 ANGLE GLES2 + Fake JNI + Keyboard Text Input Test ----
+add_executable(test_gles_jni
+    tests/test_gles_jni.cpp
+    src/java_firemint.cpp
+    src/java_offline_stubs.cpp
+)
+target_include_directories(test_gles_jni PRIVATE
+    src
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/single_header"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/zlib"
+    "${CMAKE_BINARY_DIR}/third_party/zlib"
+)
 target_link_libraries(test_gles_jni PRIVATE
+    rr3_bionic
     rr3_gles_jni
     SDL2_local
+    zlibstatic
+    dwrite
+    shell32
 )
 target_compile_definitions(test_gles_jni PRIVATE SDL_MAIN_HANDLED)
 
